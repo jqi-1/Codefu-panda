@@ -58,8 +58,8 @@ unified diff from the selected proposal.
 
 ## Configuration
 
-The agent reads optional settings from `.agent_config.json` in the target project
-root:
+The agent reads optional local settings from `.agent_config.json` in the target
+project root. Copy `.agent_config.example.json` if you want a starting point:
 
 ```json
 {

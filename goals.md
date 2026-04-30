@@ -380,12 +380,13 @@ Command execution requires per-command confirmation.
 
 The agent must:
 
-1. Propose one command.
-2. Display the exact command.
-3. Ask for confirmation.
-4. Validate the command.
-5. Execute only if the user confirmed and validation passed.
-6. Log the full result.
+1. Propose one or more command alternatives.
+2. Display the exact command if there is one proposal, or display numbered alternatives if there are multiple.
+3. Ask the user to select exactly one proposal if multiple alternatives were returned.
+4. Ask for confirmation.
+5. Validate the selected command.
+6. Execute only if the user confirmed and validation passed.
+7. Log the full result.
 
 The agent must not batch multiple commands under one confirmation.
 
@@ -399,14 +400,15 @@ File edits require per-edit confirmation.
 
 The agent must:
 
-1. Propose one unified diff.
-2. Display the full diff.
-3. Ask for confirmation.
-4. Validate the diff.
-5. Apply only if the user confirmed and validation passed.
-6. Log the full result.
+1. Propose one or more unified diff alternatives.
+2. Display the full diff if there is one proposal, or display numbered alternatives if there are multiple.
+3. Ask the user to select exactly one proposal if multiple alternatives were returned.
+4. Ask for confirmation.
+5. Validate the selected diff.
+6. Apply only if the user confirmed and validation passed.
+7. Log the full result.
 
-The agent must not batch unrelated edits under one confirmation.
+The agent must not batch multiple edits under one confirmation.
 
 If a proposed edit is blocked by validation or fails due to conflict, the agent must log the outcome and return to the menu. It must not automatically propose a replacement edit in the same menu cycle.
 
@@ -661,6 +663,8 @@ A `CommandProposal` must contain exactly one single-line command string and no s
 
 An `EditProposal` must contain exactly one unified diff block.
 
+For `run` and `edit`, the AI may return a short list of alternative proposals. Each alternative must still be parsed into an individual `CommandProposal` or `EditProposal`, and the user must select exactly one proposal before the normal confirmation step.
+
 If AI output cannot be parsed into the expected structured proposal type, the agent must log `ERROR`, print a clear message, and return to the menu. It must not execute commands or apply edits from unstructured output.
 
 #### logger
@@ -721,12 +725,16 @@ SUGGESTIONS
 MENU_INPUT
 INVALID_MENU_INPUT
 PROPOSE_COMMAND
+PROPOSE_COMMANDS
+SELECT_COMMAND
 COMMAND_APPROVED
 COMMAND_DENIED
 COMMAND_BLOCKED
 COMMAND_RESULT
 COMMAND_TIMEOUT
 PROPOSE_EDIT
+PROPOSE_EDITS
+SELECT_EDIT
 EDIT_APPROVED
 EDIT_DENIED
 EDIT_APPLIED
@@ -735,6 +743,7 @@ CONFLICT
 SANDBOX_DENIED
 BLOCKED_DESTRUCTIVE_ACTION
 INVALID_CONFIRMATION
+INVALID_PROPOSAL_SELECTION
 ERROR
 SHUTDOWN
 ```
@@ -822,7 +831,7 @@ modify logs
 
 All AI-generated commands and diffs must be validated by `permission_manager`.
 
-The AI prompt should explicitly instruct the backend not to produce shell metacharacters, chained commands, destructive commands, or more than one command or edit at a time. The deterministic permission manager remains the authority even if the AI ignores these instructions.
+The AI prompt should explicitly instruct the backend not to produce shell metacharacters, chained commands, or destructive commands. If alternatives are requested, each alternative must be independent and limited to one command or one unified diff. The deterministic permission manager remains the authority even if the AI ignores these instructions.
 
 ### 6.2 Suggestions
 
@@ -856,16 +865,18 @@ For an empty project or a project with too little information, the agent must st
 
 ### 6.3 Command Proposals
 
-When the user selects `run`, the agent must propose exactly one command.
+When the user selects `run`, the agent may propose one or more command alternatives.
 
-The command must be relevant to the project.
+Each command must be relevant to the project.
 
-The agent must display:
+If there is one command, the agent must display:
 
 ```text
 Proposed command:
 <command>
 ```
+
+If there are multiple commands, the agent must display them as numbered alternatives and ask the user to select exactly one or cancel.
 
 Then ask:
 
@@ -873,23 +884,23 @@ Then ask:
 Run this command? (yes/no)
 ```
 
-The agent must not propose multiple commands at once.
+The agent must not batch multiple commands under one confirmation.
 
-The proposed command must be a single line. Multi-line commands are invalid and must be blocked.
+Each proposed command must be a single line. Multi-line commands are invalid and must be blocked.
 
 ### 6.4 Edit Proposals
 
-When the user selects `edit`, the agent must propose exactly one unified diff.
+When the user selects `edit`, the agent may propose one or more unified diff alternatives.
 
-The diff must be relevant to the project.
+Each diff must be relevant to the project.
 
-The agent must display:
+If there is one diff, the agent must display:
 
 ```text
 Proposed edit:
 ```
 
-Then display the full unified diff.
+Then display the full unified diff. If there are multiple diffs, the agent must display them as numbered alternatives and ask the user to select exactly one or cancel.
 
 Then ask:
 
@@ -897,7 +908,7 @@ Then ask:
 Apply this edit? (yes/no)
 ```
 
-The agent must not propose multiple unrelated edits at once.
+The agent must not batch multiple edits under one confirmation.
 
 ---
 
@@ -985,25 +996,27 @@ The agent must:
 
 The agent must:
 
-1. Propose exactly one command.
-2. Log `PROPOSE_COMMAND`.
-3. Ask for confirmation.
-4. On approval, validate and execute.
-5. On denial, do nothing.
-6. Log the outcome.
-7. Return to the menu.
+1. Propose one or more command alternatives.
+2. Log `PROPOSE_COMMAND` or `PROPOSE_COMMANDS`.
+3. If there are multiple alternatives, ask the user to select exactly one or cancel.
+4. Ask for confirmation on the selected command.
+5. On approval, validate and execute.
+6. On denial or cancellation, do nothing.
+7. Log the outcome.
+8. Return to the menu.
 
 #### edit
 
 The agent must:
 
-1. Propose exactly one unified diff.
-2. Log `PROPOSE_EDIT`.
-3. Ask for confirmation.
-4. On approval, validate and apply atomically.
-5. On denial, do nothing.
-6. Log the outcome.
-7. Return to the menu.
+1. Propose one or more unified diff alternatives.
+2. Log `PROPOSE_EDIT` or `PROPOSE_EDITS`.
+3. If there are multiple alternatives, ask the user to select exactly one or cancel.
+4. Ask for confirmation on the selected diff.
+5. On approval, validate and apply atomically.
+6. On denial or cancellation, do nothing.
+7. Log the outcome.
+8. Return to the menu.
 
 #### quit
 
@@ -1087,7 +1100,7 @@ The CLI prototype must satisfy all of the following:
 - Enter an interactive menu loop.
 - Accept only `suggest`, `run`, `edit`, or `quit` as menu commands.
 - On `suggest`, display exactly two new suggestions.
-- On `run`, propose exactly one command.
+- On `run`, propose one or more command alternatives and require selecting at most one command before confirmation.
 - Require exact `yes`/`no` confirmation before command execution.
 - Trim leading and trailing whitespace before confirmation validation.
 - Validate every command before execution.
@@ -1103,7 +1116,7 @@ The CLI prototype must satisfy all of the following:
 - Capture stdout, stderr, exit code, and timeout status.
 - Log full command output.
 - On command timeout, capture available output, log `COMMAND_TIMEOUT`, and return to the menu.
-- On `edit`, propose exactly one unified diff.
+- On `edit`, propose one or more unified diff alternatives and require selecting at most one diff before confirmation.
 - Require exact `yes`/`no` confirmation before applying edits.
 - Validate every affected file path before editing.
 - Verify diff context before applying.

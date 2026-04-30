@@ -41,6 +41,24 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual("COMMAND_BLOCKED", result.event_type)
 
+    def test_command_validation_blocks_command_substitution(self):
+        result = self.manager.validate_command("pytest $(cat secret)")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("COMMAND_BLOCKED", result.event_type)
+
+    def test_command_validation_blocks_backticks_inside_quotes(self):
+        result = self.manager.validate_command('pytest "`cat secret`"')
+
+        self.assertFalse(result.ok)
+        self.assertEqual("COMMAND_BLOCKED", result.event_type)
+
+    def test_command_validation_blocks_redirection_inside_quotes(self):
+        result = self.manager.validate_command('pytest "a > b"')
+
+        self.assertFalse(result.ok)
+        self.assertEqual("COMMAND_BLOCKED", result.event_type)
+
     def test_command_validation_allows_safe_commands(self):
         (self.root / "tests").mkdir()
 
@@ -69,6 +87,12 @@ class PermissionManagerTests(unittest.TestCase):
 
     def test_command_validation_blocks_outside_paths(self):
         result = self.manager.validate_command("pytest ../outside")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("SANDBOX_DENIED", result.event_type)
+
+    def test_command_validation_blocks_nonexistent_absolute_outside_path(self):
+        result = self.manager.validate_command("python /tmp/not_created_yet.py")
 
         self.assertFalse(result.ok)
         self.assertEqual("SANDBOX_DENIED", result.event_type)

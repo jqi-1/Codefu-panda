@@ -1,5 +1,5 @@
 {
   "ai_endpoint": "http://localhost:1234/v1/chat/completions",
-  "ai_model": "your-loaded-model-id",
+  "ai_model": "replace-with-your-local-model-id",
   "command_timeout": 30
 }
