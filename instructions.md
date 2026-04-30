@@ -30,7 +30,7 @@ If this times out or fails, confirm that LM Studio is open, the server is runnin
 
 ## 3. Configure This CLI
 
-Create `.agent_config.json` in the project root:
+Change `.agent_config.json` in the project root:
 
 ```json
 {
