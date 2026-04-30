@@ -188,6 +188,87 @@ class MainFlowTests(unittest.TestCase):
 
             self.assertTrue(any(PROJECT_CODE_RISK_MESSAGE in prompt for prompt in prompts))
 
+    def test_run_flow_displays_selected_command_before_confirmation(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=[],
+                file_count=0,
+                ignored_directory_count=0,
+                tests_detected=True,
+                dependency_files=[],
+            )
+            inputs = iter(["run tests", "yes"])
+            events = []
+            runner = RecordingRunner()
+
+            def input_func(prompt):
+                events.append(("prompt", prompt))
+                return next(inputs)
+
+            def output_func(text):
+                events.append(("output", text))
+
+            handle_run(
+                StaticConnector('{"command":"python -m unittest"}'),
+                summary,
+                PermissionManager(root, logger),
+                runner,
+                logger,
+                input_func=input_func,
+                output_func=output_func,
+            )
+
+            selected_index = events.index(("output", "Selected command:"))
+            confirmation_index = next(
+                index
+                for index, event in enumerate(events)
+                if event[0] == "prompt" and "Run this command?" in event[1]
+            )
+            self.assertLess(selected_index, confirmation_index)
+            self.assertEqual([("python -m unittest", ["python", "-m", "unittest"])], runner.commands)
+
+    def test_run_flow_blocks_invalid_selected_command_without_confirmation(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Unknown",
+                secondary_languages=[],
+                likely_entry_points=[],
+                file_count=0,
+                ignored_directory_count=0,
+                tests_detected=False,
+                dependency_files=[],
+            )
+            inputs = iter(["restore changes"])
+            prompts = []
+            output = []
+            runner = RecordingRunner()
+
+            def input_func(prompt):
+                prompts.append(prompt)
+                return next(inputs)
+
+            handle_run(
+                StaticConnector('{"command":"git restore ."}'),
+                summary,
+                PermissionManager(root, logger),
+                runner,
+                logger,
+                input_func=input_func,
+                output_func=output.append,
+            )
+
+            self.assertIn("Selected command:", output)
+            self.assertIn("git restore .", output)
+            self.assertTrue(any("git restore" in item for item in output))
+            self.assertFalse(any("Run this command?" in prompt for prompt in prompts))
+            self.assertEqual([], runner.commands)
+
     def test_run_flow_lets_user_choose_from_multiple_commands(self):
         with workspace("main") as root:
             logger = AgentLogger(root)

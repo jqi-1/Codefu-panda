@@ -234,6 +234,8 @@ def handle_run(
     if proposal is None:
         return
 
+    output_func("Selected command:")
+    output_func(proposal.command)
     logger.log("SELECT_COMMAND", "Selected command proposal", command=proposal.command)
 
     validation = permission_manager.validate_command(proposal.command)

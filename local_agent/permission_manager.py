@@ -46,6 +46,7 @@ PATH_VALUE_OPTIONS = {
     "-C",
     "--cwd",
     "--config",
+    "--config-file",
     "--file",
     "--input",
     "--output",
@@ -55,6 +56,7 @@ PATH_VALUE_OPTIONS = {
     "--project",
     "--cache-dir",
     "--root",
+    "--rootdir",
     "--requirement",
     "--target",
     "-r",
@@ -70,6 +72,49 @@ NON_PATH_VALUE_OPTIONS = {
     "--branch",
 }
 PATH_VALUE_PREFIXES = tuple(option + "=" for option in PATH_VALUE_OPTIONS if option.startswith("--"))
+GIT_MUTATING_COMMANDS = {
+    "add",
+    "apply",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "commit",
+    "merge",
+    "pull",
+    "push",
+    "rebase",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "stash",
+    "switch",
+}
+GIT_READ_ONLY_COMMANDS = {"status", "diff", "log", "branch", "remote"}
+GIT_BRANCH_MUTATING_OPTIONS = {
+    "-c",
+    "-C",
+    "-d",
+    "-D",
+    "-f",
+    "-m",
+    "-M",
+    "--copy",
+    "--create-reflog",
+    "--delete",
+    "--edit-description",
+    "--force",
+    "--move",
+    "--no-track",
+    "--set-upstream-to",
+    "--track",
+    "--unset-upstream",
+}
+GIT_EXTERNAL_OR_WRITING_OPTIONS = {
+    "--ext-diff",
+    "--external-diff",
+    "--output",
+}
 
 
 @dataclass
@@ -302,20 +347,42 @@ class PermissionManager:
     def _detect_blocked_token_pattern(self, tokens: list[str]) -> str:
         base = tokens[0]
         if base == "git":
-            if len(tokens) >= 2 and tokens[1] in {"rm", "clean"}:
-                return f"Blocked: `git {tokens[1]}` is destructive in v0."
-            if len(tokens) >= 3 and tokens[1] == "reset" and "--hard" in tokens[2:]:
-                return "Blocked: `git reset --hard` is destructive in v0."
-            if len(tokens) >= 3 and tokens[1] == "remote" and tokens[2] not in {
-                "-v",
-                "show",
-                "get-url",
-            }:
-                return "Blocked: changing Git remotes is forbidden in v0."
+            return self._validate_git_command(tokens)
         if base == "python" and len(tokens) >= 2 and tokens[1] in {"-c", "-"}:
             return "Blocked: inline Python execution is not allowed in v0."
         if _is_forbidden_package_install(tokens):
             return "Blocked: user-level or system package installation flags are forbidden."
+        return ""
+
+    def _validate_git_command(self, tokens: list[str]) -> str:
+        subcommand_index, error = _git_subcommand_index(tokens)
+        if error:
+            return error
+        if subcommand_index is None:
+            return "Blocked: Git commands must use an explicit read-only subcommand in v0."
+
+        subcommand = tokens[subcommand_index]
+        args = tokens[subcommand_index + 1 :]
+        if subcommand in GIT_MUTATING_COMMANDS:
+            return (
+                f"Blocked: `git {subcommand}` can mutate the working tree, history, "
+                "or remotes in v0."
+            )
+        if subcommand not in GIT_READ_ONLY_COMMANDS:
+            return (
+                f"Blocked: `git {subcommand}` is not on the read-only Git allowlist "
+                "for v0."
+            )
+        if subcommand == "branch":
+            return _validate_git_branch_args(args)
+        if subcommand == "remote":
+            return _validate_git_remote_args(args)
+        for token in args:
+            if token in GIT_EXTERNAL_OR_WRITING_OPTIONS or token.startswith("--output="):
+                return (
+                    f"Blocked: `git {subcommand}` option `{token}` may write files "
+                    "or execute external helpers in v0."
+                )
         return ""
 
     def _validate_command_paths(self, tokens: list[str]) -> str:
@@ -501,6 +568,43 @@ def _may_modify_environment(tokens: list[str]) -> bool:
     if base == "make" and len(tokens) >= 2 and tokens[1] == "clean":
         return True
     return False
+
+
+def _git_subcommand_index(tokens: list[str]) -> tuple[int | None, str]:
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-C":
+            if index + 1 >= len(tokens):
+                return None, "Blocked: `git -C` is missing its path value."
+            index += 2
+            continue
+        if token.startswith("-"):
+            return None, f"Blocked: Git global option `{token}` is not allowed in v0."
+        return index, ""
+    return None, ""
+
+
+def _validate_git_branch_args(args: list[str]) -> str:
+    for token in args:
+        if token in GIT_BRANCH_MUTATING_OPTIONS or any(
+            token.startswith(option + "=") for option in GIT_BRANCH_MUTATING_OPTIONS
+        ):
+            return "Blocked: mutating `git branch` options are forbidden in v0."
+        if not token.startswith("-"):
+            return (
+                "Blocked: `git branch` with branch names can create, delete, or "
+                "modify branches in v0."
+            )
+    return ""
+
+
+def _validate_git_remote_args(args: list[str]) -> str:
+    if not args or args == ["-v"]:
+        return ""
+    if args[0] in {"show", "get-url"}:
+        return ""
+    return "Blocked: changing Git remotes is forbidden in v0."
 
 
 def _is_direct_pip_install(tokens: list[str]) -> bool:

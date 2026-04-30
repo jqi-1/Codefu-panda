@@ -1,2 +1,0 @@
-# No third-party Python packages are required.
-# But you must have LM Studio installed and running to use this project.

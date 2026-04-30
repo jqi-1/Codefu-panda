@@ -67,6 +67,40 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(["pytest", "tests"], result.tokens)
 
+    def test_command_validation_allows_read_only_git_commands(self):
+        commands = [
+            "git status",
+            "git diff",
+            "git log",
+            "git branch",
+            "git remote -v",
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.manager.validate_command(command)
+
+                self.assertTrue(result.ok)
+                self.assertFalse(result.risky)
+
+    def test_command_validation_blocks_mutating_git_commands(self):
+        commands = [
+            "git checkout .",
+            "git restore .",
+            "git switch feature-branch",
+            "git merge main",
+            "git rebase main",
+            "git pull",
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.manager.validate_command(command)
+
+                self.assertFalse(result.ok)
+                self.assertEqual("BLOCKED_DESTRUCTIVE_ACTION", result.event_type)
+                self.assertIn("mutate", result.message)
+
     def test_command_validation_blocks_non_whitelisted_base(self):
         result = self.manager.validate_command("bash -c pytest")
 
@@ -90,6 +124,20 @@ class PermissionManagerTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual("SANDBOX_DENIED", result.event_type)
+
+    def test_command_validation_blocks_path_option_outside_paths(self):
+        commands = [
+            "pytest --root ../outside",
+            "mypy --config-file ../mypy.ini",
+            "python -m pip install -r ../requirements.txt",
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.manager.validate_command(command)
+
+                self.assertFalse(result.ok)
+                self.assertEqual("SANDBOX_DENIED", result.event_type)
 
     def test_command_validation_blocks_nonexistent_absolute_outside_path(self):
         result = self.manager.validate_command("python /tmp/not_created_yet.py")
@@ -147,6 +195,21 @@ class PermissionManagerTests(unittest.TestCase):
                 self.skipTest("symlink creation is not available")
 
             result = self.manager.validate_command("pytest linked.txt")
+
+            self.assertFalse(result.ok)
+            self.assertEqual("SANDBOX_DENIED", result.event_type)
+
+    def test_command_validation_blocks_path_option_symlink_to_outside_root(self):
+        with workspace("outside") as outside:
+            outside_file = outside / "mypy.ini"
+            outside_file.write_text("[mypy]\n", encoding="utf-8")
+            link = self.root / "linked-mypy.ini"
+            try:
+                os.symlink(outside_file, link)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation is not available")
+
+            result = self.manager.validate_command("mypy --config-file linked-mypy.ini")
 
             self.assertFalse(result.ok)
             self.assertEqual("SANDBOX_DENIED", result.event_type)

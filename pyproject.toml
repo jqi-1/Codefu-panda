@@ -1,3 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codefu-panda"
+version = "0.1.0"
+description = "A local, permission-first coding agent CLI"
+requires-python = ">=3.10"
+
+[project.scripts]
+codefu-panda = "local_agent.main:main"
+
 [tool.black]
 line-length = 88
 target-version = ["py310"]
