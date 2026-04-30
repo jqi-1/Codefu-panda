@@ -26,6 +26,7 @@ DEFAULT_IGNORED_DIRECTORIES = {
 }
 
 INTERNAL_AGENT_FILES = {"agent_history.md"}
+MAX_TEXT_FILE_BYTES = 200_000
 
 LANGUAGE_BY_EXTENSION = {
     ".py": "Python",
@@ -87,6 +88,10 @@ TEST_FILE_SUFFIXES = (
 
 class SandboxError(RuntimeError):
     """Raised when a read would leave the project root."""
+
+
+class FileTooLargeError(RuntimeError):
+    """Raised when a text read is too large for safe AI context."""
 
 
 class ProjectScanner:
@@ -174,8 +179,26 @@ class ProjectScanner:
             language_counts=language_counts,
         )
 
-    def read_text_file(self, relative_path: str) -> str:
+    def read_text_file(self, relative_path: str, max_bytes: int = MAX_TEXT_FILE_BYTES) -> str:
         path = self._safe_path(relative_path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            if self.logger:
+                self.logger.log("ERROR", "Could not stat text file", path=path)
+            raise
+        if size > max_bytes:
+            if self.logger:
+                self.logger.log(
+                    "READ",
+                    "Skipped overly large file",
+                    path=path,
+                    bytes=size,
+                    max_bytes=max_bytes,
+                )
+            raise FileTooLargeError(
+                f"File is too large to include safely ({size} bytes > {max_bytes} bytes)."
+            )
         if _appears_binary(path):
             if self.logger:
                 self.logger.log("READ", "Skipped binary-looking file", path=path)

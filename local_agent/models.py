@@ -124,6 +124,7 @@ class ValidationResult:
     event_type: str = "COMMAND_BLOCKED"
     tokens: list[str] = field(default_factory=list)
     risky: bool = False
+    risk_message: str = ""
 
 
 @dataclass(frozen=True)

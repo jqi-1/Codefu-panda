@@ -14,12 +14,17 @@ from .ai_connector import (
     AIConnectorError,
     build_prompt,
     deterministic_suggestions,
-    parse_command,
-    parse_edit,
+    parse_commands,
+    parse_edits,
     parse_suggestions,
 )
 from .command_runner import DEFAULT_TIMEOUT_SECONDS, CommandRunner
-from .file_watcher import DEFAULT_IGNORED_DIRECTORIES, ProjectScanner
+from .file_watcher import (
+    DEFAULT_IGNORED_DIRECTORIES,
+    FileTooLargeError,
+    ProjectScanner,
+    SandboxError,
+)
 from .logger import AgentLogger, LoggerError
 from .models import CommandProposal, EditProposal, ProjectSummary, SuggestionProposal
 from .permission_manager import DEFAULT_ALLOWED_COMMANDS, PermissionManager
@@ -65,7 +70,14 @@ def main(argv: list[str] | None = None) -> int:
     permission_manager = PermissionManager(project_root, logger, config.allowed_commands)
     runner = CommandRunner(project_root, config.command_timeout)
 
-    suggestions = get_suggestions(connector, summary, logger)
+    startup_task = input("What kind of suggestions do you want? ").strip()
+    logger.log(
+        "USER_TASK",
+        "Captured startup suggestion task",
+        request_type="suggest",
+        user_task=startup_task,
+    )
+    suggestions = get_suggestions(connector, summary, logger, startup_task)
     display_suggestions(suggestions)
     logger.log("SUGGESTIONS", "Displayed startup suggestions", suggestions=suggestions.suggestions)
 
@@ -76,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
             permission_manager,
             runner,
             logger,
+            scanner=scanner,
             input_func=input,
             output_func=print,
         )
@@ -150,9 +163,13 @@ def run_menu_loop(
     permission_manager: PermissionManager,
     runner: CommandRunner,
     logger: AgentLogger,
+    scanner: ProjectScanner | None = None,
     input_func: Callable[[str], str] = input,
     output_func: Callable[[str], None] = print,
 ) -> None:
+    if scanner is None:
+        scanner = ProjectScanner(summary.root, logger=logger)
+
     while True:
         raw_choice = input_func("Type suggest, run, edit, or quit: ")
         # Menu commands are normalized consistently so `QUIT` behaves like `quit`.
@@ -160,13 +177,20 @@ def run_menu_loop(
         logger.log("MENU_INPUT", "User entered menu input", input=raw_choice.strip())
 
         if choice == "suggest":
-            suggestions = get_suggestions(connector, summary, logger)
+            user_task = input_func("What kind of suggestions do you want? ").strip()
+            logger.log(
+                "USER_TASK",
+                "Captured suggestion task",
+                request_type="suggest",
+                user_task=user_task,
+            )
+            suggestions = get_suggestions(connector, summary, logger, user_task)
             display_suggestions(suggestions, output_func)
             logger.log("SUGGESTIONS", "Displayed menu suggestions", suggestions=suggestions.suggestions)
         elif choice == "run":
             handle_run(connector, summary, permission_manager, runner, logger, input_func, output_func)
         elif choice == "edit":
-            handle_edit(connector, summary, permission_manager, logger, input_func, output_func)
+            handle_edit(connector, summary, scanner, permission_manager, logger, input_func, output_func)
         elif choice == "quit":
             logger.log("SHUTDOWN", "Agent exited cleanly")
             return
@@ -179,11 +203,10 @@ def get_suggestions(
     connector: AIConnector,
     summary: ProjectSummary,
     logger: AgentLogger,
+    user_task: str = "",
 ) -> SuggestionProposal:
-    prompt = build_prompt("suggest", summary)
     try:
-        raw = connector.generate(prompt)
-        return parse_suggestions(raw)
+        return _connector_suggestions(connector, summary, user_task)
     except AIConnectorError as exc:
         logger.log("ERROR", "Using deterministic suggestion fallback", error_message=exc)
         return deterministic_suggestions(summary)
@@ -198,13 +221,20 @@ def handle_run(
     input_func: Callable[[str], str],
     output_func: Callable[[str], None],
 ) -> None:
-    proposal = _get_command_proposal(connector, summary, logger, output_func)
+    user_task = input_func("What command/task do you want help with? ").strip()
+    logger.log("USER_TASK", "Captured command task", request_type="run", user_task=user_task)
+    if not user_task:
+        output_func("No command task entered; cancelled.")
+        return
+
+    proposals = _get_command_proposals(connector, summary, user_task, logger, output_func)
+    if not proposals:
+        return
+    proposal = _select_command_proposal(proposals, logger, input_func, output_func)
     if proposal is None:
         return
 
-    output_func("Proposed command:")
-    output_func(proposal.command)
-    logger.log("PROPOSE_COMMAND", "Proposed command", command=proposal.command)
+    logger.log("SELECT_COMMAND", "Selected command proposal", command=proposal.command)
 
     validation = permission_manager.validate_command(proposal.command)
     if not validation.ok:
@@ -213,11 +243,8 @@ def handle_run(
         return
 
     prompt = "Run this command? (yes/no)"
-    if validation.risky:
-        prompt = (
-            "Warning: this command may modify dependencies, generated files, or the "
-            "project environment.\nRun this command? (yes/no)"
-        )
+    if validation.risk_message:
+        prompt = f"{validation.risk_message}\n{prompt}"
     approved = permission_manager.confirm(prompt, input_func, output_func)
     if not approved:
         logger.log("COMMAND_DENIED", "User denied command", command=proposal.command, user_decision="no")
@@ -264,17 +291,63 @@ def handle_run(
 def handle_edit(
     connector: AIConnector,
     summary: ProjectSummary,
+    scanner: ProjectScanner,
     permission_manager: PermissionManager,
     logger: AgentLogger,
     input_func: Callable[[str], str],
     output_func: Callable[[str], None],
 ) -> None:
-    proposal = _get_edit_proposal(connector, summary, logger, output_func)
+    user_task = input_func("What code change do you want to make? ").strip()
+    logger.log("USER_TASK", "Captured edit task", request_type="edit", user_task=user_task)
+    if not user_task:
+        output_func("No code change entered; cancelled.")
+        return
+
+    raw_file_path = input_func("Which file should be edited? ").strip()
+    if not raw_file_path:
+        output_func("No target file entered; cancelled.")
+        return
+    try:
+        target_file_path = _resolve_existing_project_file(scanner.project_root, raw_file_path)
+        file_contents = scanner.read_text_file(target_file_path)
+    except ValueError as exc:
+        output_func(str(exc))
+        logger.log("SANDBOX_DENIED", "Edit target rejected", path=raw_file_path, error_message=exc)
+        return
+    except SandboxError as exc:
+        output_func(str(exc))
+        logger.log("SANDBOX_DENIED", "Edit target rejected", path=raw_file_path, error_message=exc)
+        return
+    except FileTooLargeError as exc:
+        output_func(f"Cannot read target file: {exc}")
+        logger.log("EDIT_FAILED", "Edit target too large", path=raw_file_path, error_message=exc)
+        return
+    except UnicodeDecodeError as exc:
+        output_func("Cannot read target file as UTF-8 text; edit aborted.")
+        logger.log("EDIT_FAILED", "Edit target is not text", path=raw_file_path, error_message=exc)
+        return
+    except OSError as exc:
+        output_func(f"Cannot read target file: {exc}")
+        logger.log("EDIT_FAILED", "Could not read edit target", path=raw_file_path, error_message=exc)
+        return
+
+    logger.log("EDIT_TARGET", "Loaded edit target", path=target_file_path)
+    proposals = _get_edit_proposals(
+        connector,
+        summary,
+        user_task,
+        target_file_path,
+        file_contents,
+        logger,
+        output_func,
+    )
+    if not proposals:
+        return
+    proposal = _select_edit_proposal(proposals, logger, input_func, output_func)
     if proposal is None:
         return
-    output_func("Proposed edit:")
-    output_func(proposal.diff)
-    logger.log("PROPOSE_EDIT", "Proposed edit", diff=proposal.diff)
+
+    logger.log("SELECT_EDIT", "Selected edit proposal", diff=proposal.diff)
 
     approved = permission_manager.confirm("Apply this edit? (yes/no)", input_func, output_func)
     if not approved:
@@ -286,36 +359,211 @@ def handle_edit(
     output_func(result.message)
 
 
-def _get_command_proposal(
+def _get_command_proposals(
     connector: AIConnector,
     summary: ProjectSummary,
+    user_task: str,
     logger: AgentLogger,
+    output_func: Callable[[str], None],
+) -> list[CommandProposal]:
+    try:
+        return _connector_command(connector, summary, user_task)
+    except AIConnectorError as exc:
+        output_func("Could not generate structured command proposals.")
+        logger.log("ERROR", "Command proposal failed closed", error_message=exc)
+        return []
+
+
+def _get_edit_proposals(
+    connector: AIConnector,
+    summary: ProjectSummary,
+    user_task: str,
+    target_file_path: str,
+    target_file_contents: str,
+    logger: AgentLogger,
+    output_func: Callable[[str], None],
+) -> list[EditProposal]:
+    try:
+        return _connector_edit(
+            connector,
+            summary,
+            user_task,
+            target_file_path,
+            target_file_contents,
+        )
+    except AIConnectorError as exc:
+        output_func("Could not generate structured edit proposals.")
+        logger.log("ERROR", "Edit proposal failed closed", error_message=exc)
+        return []
+
+
+def _connector_suggestions(
+    connector: AIConnector,
+    summary: ProjectSummary,
+    user_task: str,
+) -> SuggestionProposal:
+    suggest = getattr(connector, "suggest", None)
+    if callable(suggest):
+        return suggest(summary, user_task)
+    raw = connector.generate(build_prompt("suggest", summary, user_task=user_task))
+    return parse_suggestions(raw)
+
+
+def _connector_command(
+    connector: AIConnector,
+    summary: ProjectSummary,
+    user_task: str,
+) -> list[CommandProposal]:
+    propose_commands = getattr(connector, "propose_commands", None)
+    if callable(propose_commands):
+        return propose_commands(summary, user_task)
+    propose_command = getattr(connector, "propose_command", None)
+    if callable(propose_command):
+        return [propose_command(summary, user_task)]
+    raw = connector.generate(build_prompt("run", summary, user_task=user_task))
+    return parse_commands(raw)
+
+
+def _connector_edit(
+    connector: AIConnector,
+    summary: ProjectSummary,
+    user_task: str,
+    target_file_path: str,
+    target_file_contents: str,
+) -> list[EditProposal]:
+    propose_edits = getattr(connector, "propose_edits", None)
+    if callable(propose_edits):
+        return propose_edits(summary, user_task, target_file_path, target_file_contents)
+    propose_edit = getattr(connector, "propose_edit", None)
+    if callable(propose_edit):
+        return [propose_edit(summary, user_task, target_file_path, target_file_contents)]
+    raw = connector.generate(
+        build_prompt(
+            "edit",
+            summary,
+            user_task=user_task,
+            target_file_path=target_file_path,
+            target_file_contents=target_file_contents,
+        )
+    )
+    return parse_edits(raw)
+
+
+def _select_command_proposal(
+    proposals: list[CommandProposal],
+    logger: AgentLogger,
+    input_func: Callable[[str], str],
     output_func: Callable[[str], None],
 ) -> CommandProposal | None:
-    prompt = build_prompt("run", summary)
-    try:
-        raw = connector.generate(prompt)
-        return parse_command(raw)
-    except AIConnectorError as exc:
-        output_func("Could not generate a structured command proposal.")
-        logger.log("ERROR", "Command proposal failed closed", error_message=exc)
+    if len(proposals) == 1:
+        output_func("Proposed command:")
+        output_func(proposals[0].command)
+        logger.log("PROPOSE_COMMAND", "Proposed command", command=proposals[0].command)
+        return proposals[0]
+
+    output_func("Proposed commands:")
+    for index, proposal in enumerate(proposals, start=1):
+        output_func(f"{index}. {proposal.command}")
+    logger.log(
+        "PROPOSE_COMMANDS",
+        "Proposed command alternatives",
+        commands=[proposal.command for proposal in proposals],
+    )
+    selected = _choose_proposal_index(
+        len(proposals),
+        "Choose a command proposal number, or type no to cancel:",
+        logger,
+        input_func,
+        output_func,
+    )
+    if selected is None:
+        logger.log("COMMAND_DENIED", "User declined command proposals", user_decision="no")
         return None
+    return proposals[selected]
 
 
-def _get_edit_proposal(
-    connector: AIConnector,
-    summary: ProjectSummary,
+def _select_edit_proposal(
+    proposals: list[EditProposal],
     logger: AgentLogger,
+    input_func: Callable[[str], str],
     output_func: Callable[[str], None],
 ) -> EditProposal | None:
-    prompt = build_prompt("edit", summary)
-    try:
-        raw = connector.generate(prompt)
-        return parse_edit(raw)
-    except AIConnectorError as exc:
-        output_func("Could not generate a structured edit proposal.")
-        logger.log("ERROR", "Edit proposal failed closed", error_message=exc)
+    if len(proposals) == 1:
+        output_func("Proposed edit:")
+        output_func(proposals[0].diff)
+        logger.log("PROPOSE_EDIT", "Proposed edit", diff=proposals[0].diff)
+        return proposals[0]
+
+    output_func("Proposed edits:")
+    for index, proposal in enumerate(proposals, start=1):
+        output_func(f"{index}.")
+        output_func(proposal.diff)
+    logger.log(
+        "PROPOSE_EDITS",
+        "Proposed edit alternatives",
+        diffs=[proposal.diff for proposal in proposals],
+    )
+    selected = _choose_proposal_index(
+        len(proposals),
+        "Choose an edit proposal number, or type no to cancel:",
+        logger,
+        input_func,
+        output_func,
+    )
+    if selected is None:
+        logger.log("EDIT_DENIED", "User declined edit proposals", user_decision="no")
         return None
+    return proposals[selected]
+
+
+def _choose_proposal_index(
+    proposal_count: int,
+    prompt: str,
+    logger: AgentLogger,
+    input_func: Callable[[str], str],
+    output_func: Callable[[str], None],
+) -> int | None:
+    while True:
+        response = input_func(prompt + " ").strip().lower()
+        if response in {"no", "n", "cancel"}:
+            return None
+        try:
+            selected = int(response)
+        except ValueError:
+            selected = 0
+        if 1 <= selected <= proposal_count:
+            return selected - 1
+        output_func(f"Please enter a number from 1 to {proposal_count}, or no.")
+        logger.log(
+            "INVALID_PROPOSAL_SELECTION",
+            "User entered invalid proposal selection",
+            response=response,
+            proposal_count=proposal_count,
+        )
+
+
+def _resolve_existing_project_file(project_root: Path, user_path: str) -> str:
+    candidate = Path(user_path)
+    try:
+        if candidate.is_absolute():
+            resolved = candidate.resolve(strict=True)
+        else:
+            resolved = (project_root / candidate).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"Cannot read target file: {exc}") from exc
+    if not _is_relative_to(resolved, project_root):
+        raise ValueError(f"Read denied outside project root: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"Cannot edit non-file path: {user_path}")
+    return resolved.relative_to(project_root).as_posix()
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def display_suggestions(

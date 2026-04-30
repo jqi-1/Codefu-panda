@@ -3,7 +3,11 @@ import unittest
 from pathlib import Path
 
 from local_agent.logger import AgentLogger
-from local_agent.permission_manager import PermissionManager
+from local_agent.permission_manager import (
+    DEFAULT_ALLOWED_COMMANDS,
+    PROJECT_CODE_RISK_MESSAGE,
+    PermissionManager,
+)
 from tests.helpers import workspace
 
 
@@ -32,10 +36,18 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertIn("INVALID_CONFIRMATION", (self.root / "agent_history.md").read_text())
 
     def test_command_validation_blocks_shell_metacharacters(self):
-        result = self.manager.validate_command("pytest | more")
+        result = self.manager.validate_command("pytest | cat")
 
         self.assertFalse(result.ok)
         self.assertEqual("COMMAND_BLOCKED", result.event_type)
+
+    def test_command_validation_allows_safe_commands(self):
+        (self.root / "tests").mkdir()
+
+        result = self.manager.validate_command("pytest tests")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(["pytest", "tests"], result.tokens)
 
     def test_command_validation_blocks_non_whitelisted_base(self):
         result = self.manager.validate_command("bash -c pytest")
@@ -45,6 +57,12 @@ class PermissionManagerTests(unittest.TestCase):
 
     def test_command_validation_blocks_destructive_patterns(self):
         result = self.manager.validate_command("git push --force origin main")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("BLOCKED_DESTRUCTIVE_ACTION", result.event_type)
+
+    def test_command_validation_blocks_rm_rf(self):
+        result = self.manager.validate_command("rm -rf .")
 
         self.assertFalse(result.ok)
         self.assertEqual("BLOCKED_DESTRUCTIVE_ACTION", result.event_type)
@@ -60,12 +78,39 @@ class PermissionManagerTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertTrue(result.risky)
+        self.assertIn("modify dependencies", result.risk_message)
+
+    def test_command_validation_marks_project_defined_commands(self):
+        result = self.manager.validate_command("npm test")
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.risky)
+        self.assertEqual(PROJECT_CODE_RISK_MESSAGE, result.risk_message)
 
     def test_command_validation_blocks_global_installs(self):
         result = self.manager.validate_command("npm install -g eslint")
 
         self.assertFalse(result.ok)
         self.assertEqual("BLOCKED_DESTRUCTIVE_ACTION", result.event_type)
+
+    def test_pip_is_not_allowed_by_default(self):
+        self.assertNotIn("pip", DEFAULT_ALLOWED_COMMANDS)
+
+        result = self.manager.validate_command("pip install pytest")
+
+        self.assertFalse(result.ok)
+        self.assertIn("whitelist", result.message)
+
+    def test_python_m_pip_blocks_user_or_system_flags(self):
+        user_result = self.manager.validate_command("python -m pip install --user pytest")
+        system_result = self.manager.validate_command(
+            "python -m pip install --break-system-packages pytest"
+        )
+
+        self.assertFalse(user_result.ok)
+        self.assertEqual("BLOCKED_DESTRUCTIVE_ACTION", user_result.event_type)
+        self.assertFalse(system_result.ok)
+        self.assertEqual("BLOCKED_DESTRUCTIVE_ACTION", system_result.event_type)
 
     def test_command_validation_blocks_symlink_to_outside_root(self):
         with workspace("outside") as outside:
@@ -120,6 +165,24 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertEqual("CONFLICT", result.event_type)
         self.assertEqual("changed\n", target.read_text(encoding="utf-8"))
 
+    def test_apply_unified_diff_rejects_context_mismatch(self):
+        target = self.root / "hello.txt"
+        target.write_text("actual\n", encoding="utf-8")
+        diff = "\n".join(
+            [
+                "--- a/hello.txt",
+                "+++ b/hello.txt",
+                "@@ -1 +1 @@",
+                "-expected",
+                "+new",
+            ]
+        )
+
+        result = self.manager.apply_unified_diff(diff)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("CONFLICT", result.event_type)
+
     def test_apply_unified_diff_blocks_deletion(self):
         diff = "\n".join(
             [
@@ -149,6 +212,25 @@ class PermissionManagerTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual("SANDBOX_DENIED", result.event_type)
+
+    def test_apply_unified_diff_blocks_multiple_files(self):
+        diff = "\n".join(
+            [
+                "--- a/one.txt",
+                "+++ b/one.txt",
+                "@@ -0,0 +1 @@",
+                "+one",
+                "--- a/two.txt",
+                "+++ b/two.txt",
+                "@@ -0,0 +1 @@",
+                "+two",
+            ]
+        )
+
+        result = self.manager.apply_unified_diff(diff)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("EDIT_FAILED", result.event_type)
 
     def test_apply_unified_diff_blocks_binary_file(self):
         target = self.root / "data.bin"

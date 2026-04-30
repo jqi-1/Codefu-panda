@@ -1,6 +1,6 @@
 import unittest
 
-from local_agent.file_watcher import ProjectScanner, SandboxError
+from local_agent.file_watcher import FileTooLargeError, ProjectScanner, SandboxError
 from tests.helpers import workspace
 
 
@@ -48,6 +48,14 @@ class FileWatcherTests(unittest.TestCase):
 
             with self.assertRaises(UnicodeDecodeError):
                 scanner.read_text_file("data.bin")
+
+    def test_read_text_file_rejects_large_file(self):
+        with workspace("large") as root:
+            (root / "big.txt").write_text("abcd", encoding="utf-8")
+            scanner = ProjectScanner(root)
+
+            with self.assertRaises(FileTooLargeError):
+                scanner.read_text_file("big.txt", max_bytes=3)
 
 
 if __name__ == "__main__":

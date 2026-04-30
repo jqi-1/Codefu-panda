@@ -39,15 +39,22 @@ or:
 python -m local_agent.main .
 ```
 
-On startup, the agent scans the project, prints a summary, displays exactly two
-suggestions, and opens an interactive menu:
+On startup, the agent scans the project, prints a summary, asks what kind of
+suggestions you want, displays exactly two suggestions, and opens an interactive
+menu:
 
 ```text
 Type suggest, run, edit, or quit:
 ```
 
-Every command or edit proposal must be approved with exactly `yes` or `no`.
-Invalid confirmation input is rejected and logged.
+The AI may return up to three command or edit proposals. The CLI shows them
+numbered, lets you choose one, and then requires approval with exactly `yes` or
+`no`. Invalid selection or confirmation input is rejected and logged.
+
+The `suggest`, `run`, and `edit` flows ask what you want to accomplish before
+contacting the local AI endpoint. The `edit` flow also asks for a target file,
+reads that file through the project scanner, and applies only a confirmed
+unified diff from the selected proposal.
 
 ## Configuration
 
@@ -77,6 +84,8 @@ For LM Studio setup details, see `instructions.md`.
 - Shell metacharacters are blocked.
 - Destructive raw patterns are blocked.
 - Command execution is limited to an allowlist.
+- Python package operations should use `python -m pip`; direct `pip` is not
+  allowlisted by default.
 - File edits must stay inside the project root.
 - All actions, denials, errors, and command output are logged to
   `agent_history.md`.

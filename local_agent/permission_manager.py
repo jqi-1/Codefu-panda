@@ -33,6 +33,13 @@ DEFAULT_ALLOWED_COMMANDS = {
     "make",
 }
 
+PROJECT_CODE_RISK_MESSAGE = (
+    "This command may execute project-defined code. Review it before approving."
+)
+ENVIRONMENT_RISK_MESSAGE = (
+    "This command may modify dependencies, generated files, or the project environment. "
+    "Review it before approving."
+)
 FORBIDDEN_SHELL_MARKERS = (">", "<", "|", "&", ";", "$(", "`")
 FORBIDDEN_RAW_PATTERNS = ("rm -rf", "git push --force", ":(){:|:&};")
 PATH_VALUE_OPTIONS = {
@@ -48,6 +55,9 @@ PATH_VALUE_OPTIONS = {
     "--project",
     "--cache-dir",
     "--root",
+    "--requirement",
+    "--target",
+    "-r",
 }
 NON_PATH_VALUE_OPTIONS = {
     "-m",
@@ -149,7 +159,13 @@ class PermissionManager:
         if path_error:
             return ValidationResult(False, path_error, "SANDBOX_DENIED")
 
-        return ValidationResult(True, tokens=tokens, risky=self._is_risky(tokens))
+        risk_message = self._risk_message(tokens)
+        return ValidationResult(
+            True,
+            tokens=tokens,
+            risky=bool(risk_message),
+            risk_message=risk_message,
+        )
 
     def apply_unified_diff(self, diff_text: str) -> EditResult:
         try:
@@ -298,8 +314,8 @@ class PermissionManager:
                 return "Blocked: changing Git remotes is forbidden in v0."
         if base == "python" and len(tokens) >= 2 and tokens[1] in {"-c", "-"}:
             return "Blocked: inline Python execution is not allowed in v0."
-        if _is_global_install(tokens):
-            return "Blocked: global or user-level package installation is forbidden."
+        if _is_forbidden_package_install(tokens):
+            return "Blocked: user-level or system package installation flags are forbidden."
         return ""
 
     def _validate_command_paths(self, tokens: list[str]) -> str:
@@ -385,42 +401,125 @@ class PermissionManager:
             raise ValueError(f"Diff path escapes project root: {diff_path}")
         return target
 
-    def _is_risky(self, tokens: list[str]) -> bool:
+    def _risk_message(self, tokens: list[str]) -> str:
+        if self._may_execute_project_defined_code(tokens):
+            return PROJECT_CODE_RISK_MESSAGE
+        if _may_modify_environment(tokens):
+            return ENVIRONMENT_RISK_MESSAGE
+        return ""
+
+    def _may_execute_project_defined_code(self, tokens: list[str]) -> bool:
         base = tokens[0]
-        if base == "npm" and len(tokens) >= 2 and tokens[1] in {
-            "install",
-            "i",
-            "add",
-            "ci",
-            "update",
-            "uninstall",
-            "remove",
-        }:
+        if base == "npm" and len(tokens) >= 2 and tokens[1] in {"run", "test"}:
             return True
-        if base == "pnpm" and len(tokens) >= 2 and tokens[1] in {
+        if base == "pnpm" and len(tokens) >= 2 and tokens[1] not in {
             "install",
             "add",
             "update",
             "remove",
+            "--version",
+            "-v",
+            "help",
         }:
             return True
-        if base == "yarn" and len(tokens) >= 2 and tokens[1] in {
+        if base == "yarn" and len(tokens) >= 2 and tokens[1] not in {
             "install",
             "add",
             "upgrade",
             "remove",
+            "--version",
+            "-v",
+            "help",
         }:
             return True
-        if base == "pip" and len(tokens) >= 2 and tokens[1] == "install":
+        if base == "make":
             return True
-        if base == "python" and tokens[1:4] == ["-m", "pip", "install"]:
+        if base == "python" and not _is_python_m_pip_install(tokens):
+            return self._python_uses_project_file(tokens)
+        if base == "cargo" and len(tokens) >= 2 and tokens[1] in {"run", "build", "test"}:
             return True
-        if base == "make" and len(tokens) >= 2 and tokens[1] == "clean":
+        if base == "go" and len(tokens) >= 2 and tokens[1] in {"run", "build", "test"}:
             return True
         return False
 
+    def _python_uses_project_file(self, tokens: list[str]) -> bool:
+        skip_next = False
+        for token in tokens[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if token == "-m":
+                skip_next = True
+                continue
+            if token.startswith("-"):
+                continue
+            candidate = Path(token)
+            if candidate.suffix.lower() != ".py" and "/" not in token and "\\" not in token:
+                continue
+            try:
+                if candidate.is_absolute():
+                    resolved = candidate.resolve(strict=candidate.exists())
+                else:
+                    resolved = (self.project_root / candidate).resolve(
+                        strict=(self.project_root / candidate).exists()
+                    )
+            except OSError:
+                continue
+            if _is_relative_to(resolved, self.project_root):
+                return True
+        return False
 
-def _is_global_install(tokens: list[str]) -> bool:
+
+def _may_modify_environment(tokens: list[str]) -> bool:
+    base = tokens[0]
+    if base == "npm" and len(tokens) >= 2 and tokens[1] in {
+        "install",
+        "i",
+        "add",
+        "ci",
+        "update",
+        "uninstall",
+        "remove",
+    }:
+        return True
+    if base == "pnpm" and len(tokens) >= 2 and tokens[1] in {
+        "install",
+        "add",
+        "update",
+        "remove",
+    }:
+        return True
+    if base == "yarn" and len(tokens) >= 2 and tokens[1] in {
+        "install",
+        "add",
+        "upgrade",
+        "remove",
+    }:
+        return True
+    if _is_any_pip_install(tokens):
+        return True
+    if base == "make" and len(tokens) >= 2 and tokens[1] == "clean":
+        return True
+    return False
+
+
+def _is_direct_pip_install(tokens: list[str]) -> bool:
+    return len(tokens) >= 2 and tokens[0] == "pip" and tokens[1] == "install"
+
+
+def _is_python_m_pip_install(tokens: list[str]) -> bool:
+    return len(tokens) >= 4 and tokens[0] == "python" and tokens[1:4] == [
+        "-m",
+        "pip",
+        "install",
+    ]
+
+
+def _is_any_pip_install(tokens: list[str]) -> bool:
+    return _is_direct_pip_install(tokens) or _is_python_m_pip_install(tokens)
+
+
+def _is_forbidden_package_install(tokens: list[str]) -> bool:
     base = tokens[0]
     if base == "npm" and len(tokens) >= 2 and tokens[1] in {"install", "i", "add"}:
         return "-g" in tokens or "--global" in tokens
@@ -428,10 +527,8 @@ def _is_global_install(tokens: list[str]) -> bool:
         return "-g" in tokens or "--global" in tokens
     if base == "yarn":
         return (len(tokens) >= 3 and tokens[1:3] == ["global", "add"]) or "--global" in tokens
-    if base == "pip" and len(tokens) >= 2 and tokens[1] == "install":
-        return "--user" in tokens
-    if base == "python" and tokens[1:4] == ["-m", "pip", "install"]:
-        return "--user" in tokens
+    if _is_any_pip_install(tokens):
+        return "--user" in tokens or "--break-system-packages" in tokens
     if base == "cargo" and len(tokens) >= 2 and tokens[1] == "install":
         return True
     return False

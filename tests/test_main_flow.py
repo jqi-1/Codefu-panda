@@ -1,10 +1,11 @@
+import json
 import unittest
 
 from local_agent.ai_connector import AIConnectorError
 from local_agent.logger import AgentLogger
-from local_agent.main import get_suggestions, run_menu_loop
-from local_agent.models import ProjectSummary
-from local_agent.permission_manager import PermissionManager
+from local_agent.main import get_suggestions, handle_edit, handle_run, run_menu_loop
+from local_agent.models import CommandResult, EditProposal, EditResult, ProjectSummary
+from local_agent.permission_manager import PROJECT_CODE_RISK_MESSAGE, PermissionManager
 from local_agent.command_runner import CommandRunner
 from tests.helpers import workspace
 
@@ -20,6 +21,58 @@ class StaticConnector:
 
     def generate(self, prompt: str) -> str:
         return self.output
+
+
+class RecordingScanner:
+    def __init__(self, project_root, contents: str):
+        self.project_root = project_root
+        self.contents = contents
+        self.reads = []
+
+    def read_text_file(self, relative_path: str) -> str:
+        self.reads.append(relative_path)
+        return self.contents
+
+
+class RecordingEditConnector:
+    def __init__(self, proposal: EditProposal):
+        self.proposal = proposal
+        self.user_task = None
+        self.target_file_path = None
+        self.target_file_contents = None
+
+    def propose_edit(
+        self,
+        summary: ProjectSummary,
+        user_task: str,
+        target_file_path: str,
+        target_file_contents: str,
+    ) -> EditProposal:
+        self.user_task = user_task
+        self.target_file_path = target_file_path
+        self.target_file_contents = target_file_contents
+        return self.proposal
+
+
+class RecordingPermissionManager:
+    def __init__(self):
+        self.applied_diff = None
+
+    def confirm(self, prompt, input_func=input, output_func=print):
+        return True
+
+    def apply_unified_diff(self, diff: str) -> EditResult:
+        self.applied_diff = diff
+        return EditResult(True, "Edit applied.", "EDIT_APPLIED")
+
+
+class RecordingRunner:
+    def __init__(self):
+        self.commands = []
+
+    def run(self, command: str, tokens: list[str]) -> CommandResult:
+        self.commands.append((command, tokens))
+        return CommandResult(command, "", "", 0, False)
 
 
 class MainFlowTests(unittest.TestCase):
@@ -86,7 +139,7 @@ class MainFlowTests(unittest.TestCase):
                 tests_detected=False,
                 dependency_files=[],
             )
-            inputs = iter(["run", "quit"])
+            inputs = iter(["run", "run tests", "quit"])
             output = []
 
             run_menu_loop(
@@ -99,8 +152,169 @@ class MainFlowTests(unittest.TestCase):
                 output_func=output.append,
             )
 
-            self.assertIn("Could not generate a structured command proposal.", output)
+            self.assertIn("Could not generate structured command proposals.", output)
             self.assertIn("ERROR", (root / "agent_history.md").read_text(encoding="utf-8"))
+
+    def test_run_flow_warns_before_project_defined_command(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="JavaScript",
+                secondary_languages=[],
+                likely_entry_points=["package.json"],
+                file_count=1,
+                ignored_directory_count=0,
+                tests_detected=True,
+                dependency_files=["package.json"],
+            )
+            inputs = iter(["run npm tests", "no"])
+            prompts = []
+            output = []
+
+            def input_func(prompt):
+                prompts.append(prompt)
+                return next(inputs)
+
+            handle_run(
+                StaticConnector('{"command":"npm test"}'),
+                summary,
+                PermissionManager(root, logger),
+                RecordingRunner(),
+                logger,
+                input_func=input_func,
+                output_func=output.append,
+            )
+
+            self.assertTrue(any(PROJECT_CODE_RISK_MESSAGE in prompt for prompt in prompts))
+
+    def test_run_flow_lets_user_choose_from_multiple_commands(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=[],
+                file_count=0,
+                ignored_directory_count=0,
+                tests_detected=True,
+                dependency_files=[],
+            )
+            inputs = iter(["run tests", "2", "yes"])
+            output = []
+            runner = RecordingRunner()
+
+            handle_run(
+                StaticConnector('{"commands":["pytest tests","python -m unittest"]}'),
+                summary,
+                PermissionManager(root, logger),
+                runner,
+                logger,
+                input_func=lambda prompt: next(inputs),
+                output_func=output.append,
+            )
+
+            self.assertEqual([("python -m unittest", ["python", "-m", "unittest"])], runner.commands)
+            self.assertIn("Proposed commands:", output)
+
+    def test_edit_flow_reads_target_and_applies_only_unified_diff(self):
+        with workspace("main") as root:
+            target = root / "app.py"
+            target.write_text("print('hello')\n", encoding="utf-8")
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=["app.py"],
+                file_count=1,
+                ignored_directory_count=0,
+                tests_detected=False,
+                dependency_files=[],
+            )
+            diff = "\n".join(
+                [
+                    "--- a/app.py",
+                    "+++ b/app.py",
+                    "@@ -1 +1 @@",
+                    "-print('hello')",
+                    "+print('hi')",
+                ]
+            )
+            scanner = RecordingScanner(root, "print('hello')\n")
+            connector = RecordingEditConnector(EditProposal(diff))
+            permission_manager = RecordingPermissionManager()
+            inputs = iter(["change the greeting", "app.py"])
+            output = []
+
+            handle_edit(
+                connector,
+                summary,
+                scanner,
+                permission_manager,
+                logger,
+                input_func=lambda prompt: next(inputs),
+                output_func=output.append,
+            )
+
+            self.assertEqual(["app.py"], scanner.reads)
+            self.assertEqual("change the greeting", connector.user_task)
+            self.assertEqual("app.py", connector.target_file_path)
+            self.assertEqual("print('hello')\n", connector.target_file_contents)
+            self.assertEqual(diff, permission_manager.applied_diff)
+            self.assertEqual("print('hello')\n", target.read_text(encoding="utf-8"))
+
+    def test_edit_flow_lets_user_choose_from_multiple_diffs(self):
+        with workspace("main") as root:
+            target = root / "app.py"
+            target.write_text("print('hello')\n", encoding="utf-8")
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=["app.py"],
+                file_count=1,
+                ignored_directory_count=0,
+                tests_detected=False,
+                dependency_files=[],
+            )
+            first = "\n".join(
+                [
+                    "--- a/app.py",
+                    "+++ b/app.py",
+                    "@@ -1 +1 @@",
+                    "-print('hello')",
+                    "+print('hey')",
+                ]
+            )
+            second = "\n".join(
+                [
+                    "--- a/app.py",
+                    "+++ b/app.py",
+                    "@@ -1 +1 @@",
+                    "-print('hello')",
+                    "+print('hi')",
+                ]
+            )
+            scanner = RecordingScanner(root, "print('hello')\n")
+            permission_manager = RecordingPermissionManager()
+            inputs = iter(["change the greeting", "app.py", "2"])
+            output = []
+
+            handle_edit(
+                StaticConnector(json.dumps({"diffs": [first, second]})),
+                summary,
+                scanner,
+                permission_manager,
+                logger,
+                input_func=lambda prompt: next(inputs),
+                output_func=output.append,
+            )
+
+            self.assertEqual(second, permission_manager.applied_diff)
+            self.assertIn("Proposed edits:", output)
 
 
 if __name__ == "__main__":
