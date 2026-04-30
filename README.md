@@ -1,5 +1,9 @@
 # Codefu Panda
 
+<p align="center">
+  <img src="Codefu-Panda.png" alt="Codefu Panda" width="360">
+</p>
+
 A local, safety-first coding agent CLI prototype for inspecting a project,
 showing suggestions, proposing commands, and proposing file edits. The agent
 keeps enforcement local: commands and edits require explicit confirmation before
