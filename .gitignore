@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.test_workspaces/
+agent_history.md
+tmp*/
+manual_tmp/
