@@ -1,15 +1,24 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "codefu-panda"
 version = "0.1.0"
-description = "A local, permission-first coding agent CLI"
+description = "A local, safety-first coding agent CLI prototype."
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Jeremy Qi" }
+]
+dependencies = []
 
 [project.scripts]
 codefu-panda = "local_agent.main:main"
+
+[tool.setuptools.packages.find]
+include = ["local_agent*"]
 
 [tool.black]
 line-length = 88

@@ -7,9 +7,7 @@ from local_agent.ai_connector import (
     build_prompt,
     deterministic_suggestions,
     parse_command,
-    parse_commands,
     parse_edit,
-    parse_edits,
     parse_suggestions,
 )
 from local_agent.models import ProjectSummary
@@ -40,16 +38,11 @@ class AIConnectorTests(unittest.TestCase):
             parse_suggestions('{"suggestions":["Only one."]}')
 
     def test_parse_command_requires_one_line(self):
-        proposal = parse_command('{"command":"pytest"}')
+        proposal = parse_command('{"type":"command","command":"pytest"}')
 
         self.assertEqual("pytest", proposal.command)
         with self.assertRaises(AIConnectorError):
-            parse_command('{"command":"pytest\\nmypy"}')
-
-    def test_parse_commands_accepts_multiple_commands(self):
-        proposals = parse_commands('{"commands":["pytest tests","python -m unittest"]}')
-
-        self.assertEqual(["pytest tests", "python -m unittest"], [item.command for item in proposals])
+            parse_command('{"type":"command","command":"pytest\\nmypy"}')
 
     def test_parse_command_requires_json_schema(self):
         with self.assertRaises(AIConnectorError):
@@ -57,19 +50,9 @@ class AIConnectorTests(unittest.TestCase):
 
     def test_parse_edit_accepts_json_unified_diff(self):
         diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b"
-        proposal = parse_edit(
-            json.dumps({"diff": diff})
-        )
+        proposal = parse_edit(json.dumps({"type": "edit", "diff": diff}))
 
         self.assertIn("@@ -1 +1 @@", proposal.diff)
-
-    def test_parse_edits_accepts_multiple_diffs(self):
-        first = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b"
-        second = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+c"
-
-        proposals = parse_edits(json.dumps({"diffs": [first, second]}))
-
-        self.assertEqual([first, second], [item.diff for item in proposals])
 
     def test_parse_edit_requires_json_schema(self):
         with self.assertRaises(AIConnectorError):
@@ -80,7 +63,7 @@ class AIConnectorTests(unittest.TestCase):
 
         self.assertIn("User task:", prompt)
         self.assertIn("run the test suite", prompt)
-        self.assertIn('{"commands":["single-line command"]}', prompt)
+        self.assertIn('{"type":"command","command":"single-line command"}', prompt)
 
     def test_edit_prompt_includes_target_file_path_and_contents(self):
         prompt = build_prompt(
@@ -93,7 +76,7 @@ class AIConnectorTests(unittest.TestCase):
 
         self.assertIn("Target file path: app.py", prompt)
         self.assertIn("print('hello')", prompt)
-        self.assertIn('{"diffs":["unified diff"]}', prompt)
+        self.assertIn('{"type":"edit","diff":"unified diff"}', prompt)
 
     def test_deterministic_suggestions_always_returns_exactly_two(self):
         summary = ProjectSummary(

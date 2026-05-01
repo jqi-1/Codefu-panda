@@ -1,7 +1,9 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .test_workspaces/
 .agent_config.json
 agent_history.md
+.codefu-panda/
 tmp*/
 manual_tmp/

@@ -27,7 +27,13 @@ from .file_watcher import (
 )
 from .logger import AgentLogger, LoggerError
 from .models import CommandProposal, EditProposal, ProjectSummary, SuggestionProposal
-from .permission_manager import DEFAULT_ALLOWED_COMMANDS, PermissionManager
+from .permission_manager import (
+    DEFAULT_ALLOWED_COMMANDS,
+    PermissionManager,
+    validate_allowed_commands,
+)
+from .repo_summary import summarize_repo
+from .snapshots import SnapshotError, restore_snapshot
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,22 @@ class AgentConfig:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local safety-first coding agent CLI")
     parser.add_argument("project_root", help="Project root for the agent to inspect")
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("restore", "summarize"),
+        help="Optional non-interactive action to run",
+    )
+    parser.add_argument(
+        "snapshot_id",
+        nargs="?",
+        help="Snapshot id to restore; defaults to the most recent snapshot",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate proposed commands and edits without executing or applying them",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -53,6 +75,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: project root is not a directory: {project_root}")
         return 2
 
+    if args.action == "summarize":
+        if args.snapshot_id:
+            print("Error: summarize does not accept a snapshot id.")
+            return 2
+        print(summarize_repo(project_root).to_display_text())
+        return 0
+
+    if args.action == "restore":
+        try:
+            result = restore_snapshot(project_root, args.snapshot_id)
+        except SnapshotError as exc:
+            print(f"Error: {exc}")
+            return 1
+        print(f"Restored snapshot: {result.snapshot.id}")
+        for path in result.restored_paths:
+            print(f"Restored: {path.as_posix()}")
+        for path in result.removed_paths:
+            print(f"Removed: {path.as_posix()}")
+        return 0
+
+    if args.snapshot_id:
+        print("Error: snapshot id is only valid with the restore action.")
+        return 2
+
     try:
         logger = AgentLogger(project_root)
     except LoggerError as exc:
@@ -60,6 +106,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     logger.log("STARTUP", "Agent started", project_root=project_root)
+    if args.dry_run:
+        print("Dry-run mode: commands and edits will be validated but not executed.")
+        logger.log("DRY_RUN", "Agent started in dry-run mode")
     config = load_config(project_root, logger)
     scanner = ProjectScanner(project_root, config.ignored_directories, logger)
     summary = scanner.scan()
@@ -91,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
             scanner=scanner,
             input_func=input,
             output_func=print,
+            dry_run=args.dry_run,
         )
     except KeyboardInterrupt:
         print("\nExiting.")
@@ -125,7 +175,7 @@ def load_config(project_root: Path, logger: AgentLogger) -> AgentConfig:
             isinstance(item, str) and item for item in additional_allowed
         ):
             raise ValueError("additional_allowed_commands must be a list of strings")
-        allowed_commands.update(additional_allowed)
+        allowed_commands.update(validate_allowed_commands(set(additional_allowed)))
 
         additional_ignored = data.get("additional_ignored_directories", [])
         if not isinstance(additional_ignored, list) or not all(
@@ -166,6 +216,7 @@ def run_menu_loop(
     scanner: ProjectScanner | None = None,
     input_func: Callable[[str], str] = input,
     output_func: Callable[[str], None] = print,
+    dry_run: bool = False,
 ) -> None:
     if scanner is None:
         scanner = ProjectScanner(summary.root, logger=logger)
@@ -186,11 +237,33 @@ def run_menu_loop(
             )
             suggestions = get_suggestions(connector, summary, logger, user_task)
             display_suggestions(suggestions, output_func)
-            logger.log("SUGGESTIONS", "Displayed menu suggestions", suggestions=suggestions.suggestions)
+            logger.log(
+                "SUGGESTIONS",
+                "Displayed menu suggestions",
+                suggestions=suggestions.suggestions,
+            )
         elif choice == "run":
-            handle_run(connector, summary, permission_manager, runner, logger, input_func, output_func)
+            handle_run(
+                connector,
+                summary,
+                permission_manager,
+                runner,
+                logger,
+                input_func,
+                output_func,
+                dry_run=dry_run,
+            )
         elif choice == "edit":
-            handle_edit(connector, summary, scanner, permission_manager, logger, input_func, output_func)
+            handle_edit(
+                connector,
+                summary,
+                scanner,
+                permission_manager,
+                logger,
+                input_func,
+                output_func,
+                dry_run=dry_run,
+            )
         elif choice == "quit":
             logger.log("SHUTDOWN", "Agent exited cleanly")
             return
@@ -220,6 +293,7 @@ def handle_run(
     logger: AgentLogger,
     input_func: Callable[[str], str],
     output_func: Callable[[str], None],
+    dry_run: bool = False,
 ) -> None:
     user_task = input_func("What command/task do you want help with? ").strip()
     logger.log("USER_TASK", "Captured command task", request_type="run", user_task=user_task)
@@ -244,15 +318,40 @@ def handle_run(
         logger.log(validation.event_type, validation.message, command=proposal.command)
         return
 
+    if dry_run:
+        if validation.risky:
+            output_func("Dry-run: command is risky and would require confirmation.")
+            output_func(validation.risk_message)
+        else:
+            output_func("Dry-run: command would be allowed.")
+        logger.log(
+            "COMMAND_DRY_RUN",
+            "Dry-run command validation completed",
+            command=proposal.command,
+            risky=validation.risky,
+            risk_message=validation.risk_message,
+        )
+        return
+
     prompt = "Run this command? (yes/no)"
     if validation.risk_message:
         prompt = f"{validation.risk_message}\n{prompt}"
     approved = permission_manager.confirm(prompt, input_func, output_func)
     if not approved:
-        logger.log("COMMAND_DENIED", "User denied command", command=proposal.command, user_decision="no")
+        logger.log(
+            "COMMAND_DENIED",
+            "User denied command",
+            command=proposal.command,
+            user_decision="no",
+        )
         return
 
-    logger.log("COMMAND_APPROVED", "User approved command", command=proposal.command, user_decision="yes")
+    logger.log(
+        "COMMAND_APPROVED",
+        "User approved command",
+        command=proposal.command,
+        user_decision="yes",
+    )
     validation = permission_manager.validate_command(proposal.command)
     if not validation.ok:
         output_func(validation.message)
@@ -298,6 +397,7 @@ def handle_edit(
     logger: AgentLogger,
     input_func: Callable[[str], str],
     output_func: Callable[[str], None],
+    dry_run: bool = False,
 ) -> None:
     user_task = input_func("What code change do you want to make? ").strip()
     logger.log("USER_TASK", "Captured edit task", request_type="edit", user_task=user_task)
@@ -330,7 +430,12 @@ def handle_edit(
         return
     except OSError as exc:
         output_func(f"Cannot read target file: {exc}")
-        logger.log("EDIT_FAILED", "Could not read edit target", path=raw_file_path, error_message=exc)
+        logger.log(
+            "EDIT_FAILED",
+            "Could not read edit target",
+            path=raw_file_path,
+            error_message=exc,
+        )
         return
 
     logger.log("EDIT_TARGET", "Loaded edit target", path=target_file_path)
@@ -351,6 +456,11 @@ def handle_edit(
 
     logger.log("SELECT_EDIT", "Selected edit proposal", diff=proposal.diff)
 
+    if dry_run:
+        result = permission_manager.apply_unified_diff(proposal.diff, dry_run=True)
+        output_func(result.message)
+        return
+
     approved = permission_manager.confirm("Apply this edit? (yes/no)", input_func, output_func)
     if not approved:
         logger.log("EDIT_DENIED", "User denied edit", diff=proposal.diff, user_decision="no")
@@ -359,6 +469,8 @@ def handle_edit(
     logger.log("EDIT_APPROVED", "User approved edit", diff=proposal.diff, user_decision="yes")
     result = permission_manager.apply_unified_diff(proposal.diff)
     output_func(result.message)
+    if result.ok and result.snapshot_id:
+        output_func(f"Snapshot saved: {result.snapshot_id}")
 
 
 def _get_command_proposals(

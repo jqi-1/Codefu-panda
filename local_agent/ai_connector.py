@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from .model_protocol import ModelProtocolError, parse_model_proposal
 from .models import CommandProposal, EditProposal, ProjectSummary, SuggestionProposal
 
 
@@ -87,8 +87,8 @@ class AIConnector:
                     "role": "system",
                     "content": (
                         "You are an advisory local coding assistant. Return only the "
-                        "requested structured proposal or proposals. Do not execute commands, do "
-                        "not request shell metacharacters, and do not propose "
+                        "requested structured JSON object. Do not execute commands, "
+                        "do not request shell metacharacters, and do not propose "
                         "destructive actions."
                     ),
                 },
@@ -132,17 +132,17 @@ def build_prompt(
         )
     elif request_type == "run":
         expected = (
-            'Return JSON exactly as {"commands":["single-line command"]}. Include '
-            f"one to {MAX_PROPOSALS} command strings. Each command must be one "
-            "line, relevant to the user task, and contain no shell metacharacters."
+            'Return JSON exactly as {"type":"command","command":"single-line command"}. '
+            "The command must be one line, relevant to the user task, and contain "
+            "no shell metacharacters."
         )
     elif request_type == "edit":
         if target_file_path is None or target_file_contents is None:
             raise ValueError("Edit prompts require a target file path and contents")
         expected = (
-            'Return JSON exactly as {"diffs":["unified diff"]}. Include one to '
-            f"{MAX_PROPOSALS} unified diffs. Each diff must affect only the target "
-            "file and be based on the current target file contents below."
+            'Return JSON exactly as {"type":"edit","diff":"unified diff"}. '
+            "The diff must affect only the target file and be based on the "
+            "current target file contents below."
         )
     else:
         raise ValueError(f"Unknown request type: {request_type}")
@@ -159,7 +159,10 @@ def build_prompt(
         "Safety constraints:",
         "- Return only valid JSON matching the schema. No markdown fences or commentary.",
         "- Do not execute commands or claim that commands have been executed.",
-        "- Do not propose destructive actions, shell metacharacters, pipes, redirects, or command chaining.",
+        (
+            "- Do not propose destructive actions, shell metacharacters, pipes, "
+            "redirects, or command chaining."
+        ),
         "- Keep paths project-relative and inside the project root.",
         "- For Python package operations, use python -m pip instead of direct pip.",
     ]
@@ -167,8 +170,10 @@ def build_prompt(
     if request_type == "run":
         lines.extend(
             [
-                "- Prefer read-only or test commands unless the user explicitly asks for dependency or build changes.",
-                f"- Include no more than {MAX_PROPOSALS} command alternatives.",
+                (
+                    "- Prefer read-only or test commands unless the user explicitly "
+                    "asks for dependency or build changes."
+                ),
             ]
         )
     if request_type == "edit":
@@ -176,7 +181,6 @@ def build_prompt(
             [
                 "- The unified diff must use --- a/<target> and +++ b/<target> paths.",
                 "- Do not delete files, rename files, or edit multiple files.",
-                f"- Include no more than {MAX_PROPOSALS} edit alternatives.",
                 "",
                 f"Target file path: {target_file_path}",
                 "Current target file contents:",
@@ -197,18 +201,22 @@ def build_prompt(
 
 
 def parse_suggestions(raw_output: str) -> SuggestionProposal:
-    stripped = raw_output.strip()
-    suggestions: list[str] | None = None
     try:
-        data = json.loads(stripped)
-        if isinstance(data, dict) and isinstance(data.get("suggestions"), list):
-            suggestions = [str(item).strip() for item in data["suggestions"]]
-    except json.JSONDecodeError:
-        suggestions = _parse_numbered_suggestions(stripped)
-
-    if suggestions is None:
-        suggestions = _parse_numbered_suggestions(stripped)
-    suggestions = [item for item in suggestions if item]
+        data = json.loads(raw_output.strip())
+    except json.JSONDecodeError as exc:
+        raise AIConnectorError("Suggestion output was not JSON") from exc
+    if not isinstance(data, dict) or set(data.keys()) != {"suggestions"}:
+        raise AIConnectorError("Suggestion output did not match the required schema")
+    suggestions_data = data["suggestions"]
+    if not isinstance(suggestions_data, list):
+        raise AIConnectorError("Suggestion output did not contain a suggestion list")
+    suggestions: list[str] = []
+    for item in suggestions_data:
+        if not isinstance(item, str):
+            raise AIConnectorError("Suggestion output contained a non-string suggestion")
+        suggestion = item.strip()
+        if suggestion:
+            suggestions.append(suggestion)
     if len(suggestions) != 2:
         raise AIConnectorError("Suggestion output did not contain exactly two items")
     return SuggestionProposal(suggestions=suggestions)
@@ -220,32 +228,12 @@ def parse_command(raw_output: str) -> CommandProposal:
 
 def parse_commands(raw_output: str) -> list[CommandProposal]:
     try:
-        data = json.loads(raw_output.strip())
-    except json.JSONDecodeError as exc:
-        raise AIConnectorError("Command output was not JSON") from exc
-    if not isinstance(data, dict):
-        raise AIConnectorError("Command output did not match the required schema")
-    if set(data.keys()) == {"command"}:
-        commands = [data["command"]]
-    elif set(data.keys()) == {"commands"}:
-        commands = data["commands"]
-    else:
-        raise AIConnectorError("Command output did not match the required schema")
-    if not isinstance(commands, list):
-        raise AIConnectorError("Command output did not contain a command list")
-    proposals: list[CommandProposal] = []
-    for item in commands:
-        if not isinstance(item, str):
-            raise AIConnectorError("Command output contained a non-string command")
-        command = item.strip()
-        if not command or "\n" in command or "\r" in command:
-            raise AIConnectorError("Command output contained a non-single-line command")
-        proposals.append(CommandProposal(command=command))
-    if not 1 <= len(proposals) <= MAX_PROPOSALS:
-        raise AIConnectorError(
-            f"Command output must contain between 1 and {MAX_PROPOSALS} commands"
-        )
-    return proposals
+        proposal = parse_model_proposal(raw_output)
+    except ModelProtocolError as exc:
+        raise AIConnectorError("Command output did not match the strict model protocol") from exc
+    if not isinstance(proposal, CommandProposal):
+        raise AIConnectorError("Command output was not a command proposal")
+    return [proposal]
 
 
 def parse_edit(raw_output: str) -> EditProposal:
@@ -254,32 +242,15 @@ def parse_edit(raw_output: str) -> EditProposal:
 
 def parse_edits(raw_output: str) -> list[EditProposal]:
     try:
-        data = json.loads(raw_output.strip())
-    except json.JSONDecodeError as exc:
-        raise AIConnectorError("Edit output was not JSON") from exc
-    if not isinstance(data, dict):
-        raise AIConnectorError("Edit output did not match the required schema")
-    if set(data.keys()) == {"diff"}:
-        diffs = [data["diff"]]
-    elif set(data.keys()) == {"diffs"}:
-        diffs = data["diffs"]
-    else:
-        raise AIConnectorError("Edit output did not match the required schema")
-    if not isinstance(diffs, list):
-        raise AIConnectorError("Edit output did not contain a diff list")
-    proposals: list[EditProposal] = []
-    for item in diffs:
-        if not isinstance(item, str):
-            raise AIConnectorError("Edit output contained a non-string diff")
-        diff = item.strip()
-        if not diff.startswith("--- ") or "\n+++ " not in diff or "\n@@ " not in diff:
-            raise AIConnectorError("Edit output contained a non-unified diff")
-        proposals.append(EditProposal(diff=diff))
-    if not 1 <= len(proposals) <= MAX_PROPOSALS:
-        raise AIConnectorError(
-            f"Edit output must contain between 1 and {MAX_PROPOSALS} diffs"
-        )
-    return proposals
+        proposal = parse_model_proposal(raw_output)
+    except ModelProtocolError as exc:
+        raise AIConnectorError("Edit output did not match the strict model protocol") from exc
+    if not isinstance(proposal, EditProposal):
+        raise AIConnectorError("Edit output was not an edit proposal")
+    diff = proposal.diff
+    if not diff.startswith("--- ") or "\n+++ " not in diff or "\n@@ " not in diff:
+        raise AIConnectorError("Edit output contained a non-unified diff")
+    return [proposal]
 
 
 def deterministic_suggestions(summary: ProjectSummary) -> SuggestionProposal:
@@ -304,13 +275,3 @@ def deterministic_suggestions(summary: ProjectSummary) -> SuggestionProposal:
     else:
         project_health = "Project health: Add a minimal test file or smoke test."
     return SuggestionProposal([code_quality, project_health])
-
-
-def _parse_numbered_suggestions(text: str) -> list[str]:
-    suggestions: list[str] = []
-    for line in text.splitlines():
-        cleaned = line.strip()
-        match = re.match(r"^\d+[.)]\s+(.*)$", cleaned)
-        if match:
-            suggestions.append(match.group(1).strip())
-    return suggestions

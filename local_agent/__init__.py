@@ -6,6 +6,9 @@ __all__ = [
     "file_watcher",
     "logger",
     "main",
+    "model_protocol",
     "models",
     "permission_manager",
+    "repo_summary",
+    "snapshots",
 ]

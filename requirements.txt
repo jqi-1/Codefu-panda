@@ -1,0 +1,3 @@
+# No third-party Python packages are required.
+# LM Studio is optional and only needed for AI-backed suggestions,
+# command proposals, and edit proposals.

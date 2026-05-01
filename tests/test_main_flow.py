@@ -1,12 +1,18 @@
-import json
 import unittest
 
 from local_agent.ai_connector import AIConnectorError
+from local_agent.command_runner import CommandRunner
 from local_agent.logger import AgentLogger
 from local_agent.main import get_suggestions, handle_edit, handle_run, run_menu_loop
-from local_agent.models import CommandResult, EditProposal, EditResult, ProjectSummary
+from local_agent.models import (
+    CommandProposal,
+    CommandResult,
+    EditProposal,
+    EditResult,
+    ProjectSummary,
+)
 from local_agent.permission_manager import PROJECT_CODE_RISK_MESSAGE, PermissionManager
-from local_agent.command_runner import CommandRunner
+from local_agent.snapshots import list_snapshots
 from tests.helpers import workspace
 
 
@@ -52,6 +58,32 @@ class RecordingEditConnector:
         self.target_file_path = target_file_path
         self.target_file_contents = target_file_contents
         return self.proposal
+
+
+class RecordingCommandListConnector:
+    def __init__(self, proposals: list[CommandProposal]):
+        self.proposals = proposals
+
+    def propose_commands(
+        self,
+        summary: ProjectSummary,
+        user_task: str,
+    ) -> list[CommandProposal]:
+        return self.proposals
+
+
+class RecordingEditListConnector:
+    def __init__(self, proposals: list[EditProposal]):
+        self.proposals = proposals
+
+    def propose_edits(
+        self,
+        summary: ProjectSummary,
+        user_task: str,
+        target_file_path: str,
+        target_file_contents: str,
+    ) -> list[EditProposal]:
+        return self.proposals
 
 
 class RecordingPermissionManager:
@@ -177,7 +209,7 @@ class MainFlowTests(unittest.TestCase):
                 return next(inputs)
 
             handle_run(
-                StaticConnector('{"command":"npm test"}'),
+                StaticConnector('{"type":"command","command":"npm test"}'),
                 summary,
                 PermissionManager(root, logger),
                 RecordingRunner(),
@@ -213,7 +245,7 @@ class MainFlowTests(unittest.TestCase):
                 events.append(("output", text))
 
             handle_run(
-                StaticConnector('{"command":"python -m unittest"}'),
+                StaticConnector('{"type":"command","command":"python -m unittest"}'),
                 summary,
                 PermissionManager(root, logger),
                 runner,
@@ -229,7 +261,10 @@ class MainFlowTests(unittest.TestCase):
                 if event[0] == "prompt" and "Run this command?" in event[1]
             )
             self.assertLess(selected_index, confirmation_index)
-            self.assertEqual([("python -m unittest", ["python", "-m", "unittest"])], runner.commands)
+            self.assertEqual(
+                [("python -m unittest", ["python", "-m", "unittest"])],
+                runner.commands,
+            )
 
     def test_run_flow_blocks_invalid_selected_command_without_confirmation(self):
         with workspace("main") as root:
@@ -254,7 +289,7 @@ class MainFlowTests(unittest.TestCase):
                 return next(inputs)
 
             handle_run(
-                StaticConnector('{"command":"git restore ."}'),
+                StaticConnector('{"type":"command","command":"git restore ."}'),
                 summary,
                 PermissionManager(root, logger),
                 runner,
@@ -287,7 +322,12 @@ class MainFlowTests(unittest.TestCase):
             runner = RecordingRunner()
 
             handle_run(
-                StaticConnector('{"commands":["pytest tests","python -m unittest"]}'),
+                RecordingCommandListConnector(
+                    [
+                        CommandProposal("pytest tests"),
+                        CommandProposal("python -m unittest"),
+                    ]
+                ),
                 summary,
                 PermissionManager(root, logger),
                 runner,
@@ -296,7 +336,10 @@ class MainFlowTests(unittest.TestCase):
                 output_func=output.append,
             )
 
-            self.assertEqual([("python -m unittest", ["python", "-m", "unittest"])], runner.commands)
+            self.assertEqual(
+                [("python -m unittest", ["python", "-m", "unittest"])],
+                runner.commands,
+            )
             self.assertIn("Proposed commands:", output)
 
     def test_edit_flow_reads_target_and_applies_only_unified_diff(self):
@@ -385,7 +428,7 @@ class MainFlowTests(unittest.TestCase):
             output = []
 
             handle_edit(
-                StaticConnector(json.dumps({"diffs": [first, second]})),
+                RecordingEditListConnector([EditProposal(first), EditProposal(second)]),
                 summary,
                 scanner,
                 permission_manager,
@@ -396,6 +439,173 @@ class MainFlowTests(unittest.TestCase):
 
             self.assertEqual(second, permission_manager.applied_diff)
             self.assertIn("Proposed edits:", output)
+
+    def test_dry_run_command_validates_but_does_not_run(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=[],
+                file_count=0,
+                ignored_directory_count=0,
+                tests_detected=True,
+                dependency_files=[],
+            )
+            runner = RecordingRunner()
+            output = []
+
+            handle_run(
+                StaticConnector('{"type":"command","command":"python -m unittest"}'),
+                summary,
+                PermissionManager(root, logger),
+                runner,
+                logger,
+                input_func=lambda prompt: "run tests",
+                output_func=output.append,
+                dry_run=True,
+            )
+
+            self.assertEqual([], runner.commands)
+            self.assertIn("Dry-run: command would be allowed.", output)
+
+    def test_dry_run_blocked_command_reports_blocked(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Unknown",
+                secondary_languages=[],
+                likely_entry_points=[],
+                file_count=0,
+                ignored_directory_count=0,
+                tests_detected=False,
+                dependency_files=[],
+            )
+            output = []
+
+            handle_run(
+                StaticConnector('{"type":"command","command":"git restore ."}'),
+                summary,
+                PermissionManager(root, logger),
+                RecordingRunner(),
+                logger,
+                input_func=lambda prompt: "restore changes",
+                output_func=output.append,
+                dry_run=True,
+            )
+
+            self.assertTrue(any("git restore" in item for item in output))
+
+    def test_dry_run_risky_command_reports_confirmation_needed(self):
+        with workspace("main") as root:
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="JavaScript",
+                secondary_languages=[],
+                likely_entry_points=["package.json"],
+                file_count=1,
+                ignored_directory_count=0,
+                tests_detected=True,
+                dependency_files=["package.json"],
+            )
+            output = []
+
+            handle_run(
+                StaticConnector('{"type":"command","command":"npm test"}'),
+                summary,
+                PermissionManager(root, logger),
+                RecordingRunner(),
+                logger,
+                input_func=lambda prompt: "run npm tests",
+                output_func=output.append,
+                dry_run=True,
+            )
+
+            self.assertIn(
+                "Dry-run: command is risky and would require confirmation.",
+                output,
+            )
+            self.assertIn(PROJECT_CODE_RISK_MESSAGE, output)
+
+    def test_dry_run_edit_validates_but_does_not_modify_file_or_snapshot(self):
+        with workspace("main") as root:
+            target = root / "app.py"
+            target.write_text("print('hello')\n", encoding="utf-8")
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=["app.py"],
+                file_count=1,
+                ignored_directory_count=0,
+                tests_detected=False,
+                dependency_files=[],
+            )
+            diff = "\n".join(
+                [
+                    "--- a/app.py",
+                    "+++ b/app.py",
+                    "@@ -1 +1 @@",
+                    "-print('hello')",
+                    "+print('hi')",
+                ]
+            )
+            scanner = RecordingScanner(root, "print('hello')\n")
+            output = []
+            inputs = iter(["change greeting", "app.py"])
+
+            handle_edit(
+                RecordingEditConnector(EditProposal(diff)),
+                summary,
+                scanner,
+                PermissionManager(root, logger),
+                logger,
+                input_func=lambda prompt: next(inputs),
+                output_func=output.append,
+                dry_run=True,
+            )
+
+            self.assertEqual("print('hello')\n", target.read_text(encoding="utf-8"))
+            self.assertEqual([], list_snapshots(root))
+            self.assertIn("Dry-run: edit would modify app.py.", output)
+
+    def test_dry_run_edit_with_invalid_diff_fails(self):
+        with workspace("main") as root:
+            target = root / "app.py"
+            target.write_text("print('hello')\n", encoding="utf-8")
+            logger = AgentLogger(root)
+            summary = ProjectSummary(
+                root=root,
+                primary_language="Python",
+                secondary_languages=[],
+                likely_entry_points=["app.py"],
+                file_count=1,
+                ignored_directory_count=0,
+                tests_detected=False,
+                dependency_files=[],
+            )
+            scanner = RecordingScanner(root, "print('hello')\n")
+            output = []
+            inputs = iter(["change greeting", "app.py"])
+
+            handle_edit(
+                RecordingEditConnector(EditProposal("not a diff")),
+                summary,
+                scanner,
+                PermissionManager(root, logger),
+                logger,
+                input_func=lambda prompt: next(inputs),
+                output_func=output.append,
+                dry_run=True,
+            )
+
+            self.assertEqual("print('hello')\n", target.read_text(encoding="utf-8"))
+            self.assertEqual([], list_snapshots(root))
+            self.assertIn("Unified diff must start each file with `--- `.", output)
 
 
 if __name__ == "__main__":

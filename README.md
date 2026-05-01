@@ -5,78 +5,134 @@
 </p>
 
 A local, safety-first coding agent CLI prototype for inspecting a project,
-showing suggestions, proposing commands, and proposing file edits. The agent
-keeps enforcement local: commands and edits require explicit confirmation before
-anything is executed or changed.
+showing suggestions, validating command proposals, and applying tightly scoped
+unified-diff edits. The AI backend is advisory only; deterministic local code
+enforces safety.
 
-## What it does
+## What It Does
 
-Codefu Panda scans a project directory, summarizes likely languages and entry
-points, asks what kind of help you want, and then offers an interactive menu:
+Codefu Panda scans a project directory and starts an interactive menu:
 
 ```text
 Type suggest, run, edit, or quit:
 ```
 
-- `suggest` asks the advisory AI for exactly two project suggestions.
-- `run` asks for command proposals, lets you choose one, validates it locally,
-  and only runs it after explicit approval.
-- `edit` asks for unified-diff edit proposals for one target file, then applies
-  only a selected and approved diff.
+- `suggest` asks for project suggestions.
+- `run` asks for a command proposal, validates it locally, and runs it only
+  after explicit approval.
+- `edit` asks for a unified-diff proposal for one target file, snapshots the
+  original file, and applies the selected edit only after approval.
+- `summarize` prints a read-only repository summary without using AI.
+- `restore` restores the most recent edit snapshot.
 
-The AI backend only proposes text. Validation, approval, command execution, and
-file edits are handled locally by deterministic code.
-
-## Safety model
-
-- Commands are validated before execution.
-- Commands run with `shell=False`.
-- Shell metacharacters and command chaining constructs are blocked.
-- Dangerous commands and destructive raw patterns are blocked.
-- Risky commands, such as dependency installs or project-defined scripts, require
-  explicit `yes` confirmation.
-- The selected command is validated again immediately before execution.
-- File edits must be unified diffs.
-- File edits are sandboxed to the project root.
-- The AI connector cannot execute commands or apply edits directly.
-- `agent_history.md` is ignored by Git because it may contain command output,
-  prompts, diffs, file paths, errors, and other sensitive information. Do not
-  commit it accidentally.
-
-## Quick start
+## Quick Start
 
 Requirements:
 
 - Python 3.10+
-- Optional: LM Studio running an OpenAI-compatible local API server
+- Optional: LM Studio running an OpenAI-compatible local API server for
+  AI-backed suggestions, command proposals, and edit proposals
 
-Create an environment and install the CLI in editable mode:
+Install the CLI in editable mode:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 python -m pip install -e .
 ```
 
 Run against the current project:
 
 ```powershell
-python -m local_agent .
+codefu-panda .
 ```
 
-or, after editable install:
+The module entry points are also available:
+
+```powershell
+python -m local_agent .
+python -m local_agent.main .
+```
+
+## Common Commands
+
+Print help:
+
+```powershell
+codefu-panda --help
+```
+
+Run the interactive assistant:
 
 ```powershell
 codefu-panda .
 ```
 
-The legacy module entry point also remains available:
+Run the interactive assistant in dry-run mode:
 
 ```powershell
-python -m local_agent.main .
+codefu-panda . --dry-run
 ```
 
-## LM Studio setup
+Print a read-only repository summary:
+
+```powershell
+codefu-panda . summarize
+```
+
+Restore the most recent edit snapshot:
+
+```powershell
+codefu-panda . restore
+```
+
+Restore a specific snapshot:
+
+```powershell
+codefu-panda . restore 2026-04-30T12-34-56Z
+```
+
+## Safety Model
+
+- Commands are validated before execution.
+- Commands run with `shell=False`.
+- Shell metacharacters and command chaining constructs are blocked.
+- Dangerous commands and destructive raw patterns are blocked.
+- `npx`, dependency changes, and project-defined scripts are treated as risky
+  and require explicit review.
+- Shell wrapper commands such as `bash`, `powershell`, and `sudo` cannot be made
+  safe through local config.
+- The selected command is validated again immediately before execution.
+- File edits must be unified diffs.
+- File edits are sandboxed to the project root.
+- Real edits create snapshots in `.codefu-panda/snapshots/`.
+- Dry-run mode validates commands and edits without executing or modifying
+  files.
+- The AI connector cannot execute commands or apply edits directly.
+- `agent_history.md` and `.codefu-panda/` are ignored by Git because they may
+  contain local paths, command output, diffs, and file contents.
+
+More detail is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Strict Model Protocol
+
+AI-backed command and edit proposals must be exactly one JSON object. Markdown
+fences, prose before or after JSON, arrays, unknown types, missing fields, and
+extra fields fail closed.
+
+Supported proposal shapes include:
+
+```json
+{"type":"command","command":"python -m unittest"}
+```
+
+```json
+{"type":"edit","diff":"--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new"}
+```
+
+```json
+{"type":"plan","steps":["Inspect test failures","Run the test suite"]}
+```
+
+## LM Studio Setup
 
 1. Install and open LM Studio.
 2. Download a chat or instruct model.
@@ -94,11 +150,9 @@ Example configuration:
 }
 ```
 
-The CLI still fails closed if LM Studio is unavailable or returns invalid
-structured output. Suggestions fall back to deterministic local suggestions;
-command and edit proposals are not executed or applied.
-
-More detailed LM Studio notes are in `instructions.md`.
+The CLI fails closed if LM Studio is unavailable or returns invalid structured
+output. Suggestions fall back to deterministic local suggestions; command and
+edit proposals are not executed or applied.
 
 ## Configuration
 
@@ -115,42 +169,7 @@ Supported keys:
 
 The runtime uses only the Python standard library.
 
-## Usage examples
-
-Run with the package module:
-
-```powershell
-python -m local_agent .
-```
-
-Run with the main module:
-
-```powershell
-python -m local_agent.main .
-```
-
-Run with the console command after editable install:
-
-```powershell
-codefu-panda .
-```
-
-Run the test suite:
-
-```powershell
-python -m unittest discover
-```
-
-Run a syntax compile check:
-
-```powershell
-python -m compileall local_agent tests
-```
-
 ## Development
-
-Keep changes small and safety-first. The project should remain dependency-light,
-compatible with Python 3.10+, and usable as a local CLI.
 
 Useful checks:
 
@@ -163,35 +182,11 @@ Do not change the AI connector to execute commands or apply edits. Command
 execution must continue through the permission manager and command runner, and
 edits must continue through unified-diff validation.
 
-## Threat model
+## Known Limitations
 
-Codefu Panda assumes AI output is untrusted. The advisory backend may suggest
-commands, paths, or diffs that are unsafe, malformed, or unrelated to the user's
-intent, so local validation is the enforcement boundary.
-
-Command protections:
-
-- Commands are parsed with `shlex` and executed as token lists with
-  `shell=False`.
-- Shell metacharacters such as pipes, redirects, command separators, command
-  substitution, and backticks are blocked.
-- Commands outside the allowlist are blocked.
-- Dangerous commands and destructive Git operations are blocked.
-- Working-tree-mutating or history-mutating Git commands are blocked in v0.
-- Path arguments must stay inside the project root, including when supplied
-  after path-valued options.
-- Symlink escapes are rejected.
-
-Edit protections:
-
-- Edits must be unified diffs.
-- Only one file may be edited per diff in v0.
-- File deletion, renames, binary edits, and paths outside the project root are
-  rejected.
-- The user must explicitly approve the selected diff before it is applied.
-
-Logging note:
-
-`agent_history.md` is append-only local history for startup events, prompts,
-denials, approvals, command output, diffs, and errors. Treat it as sensitive.
-It is ignored by Git, but users should still avoid copying or committing it.
+- The CLI is intentionally conservative and may block valid commands.
+- AI-backed `run` and `edit` require a working LM Studio-compatible endpoint.
+- The AI backend is advisory only; invalid or unsafe model output fails closed.
+- v0.2 edits are still intentionally limited.
+- Codefu Panda does not automatically commit, push, install dependencies, or run
+  background tasks.

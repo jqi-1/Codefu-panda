@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .logger import AgentLogger
 from .models import EditResult, ValidationResult
+from .snapshots import SnapshotError, create_snapshot
 
 
 DEFAULT_ALLOWED_COMMANDS = {
@@ -31,6 +32,17 @@ DEFAULT_ALLOWED_COMMANDS = {
     "go",
     "cargo",
     "make",
+}
+FORBIDDEN_ALLOWED_COMMANDS = {
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "sudo",
+    "su",
 }
 
 PROJECT_CODE_RISK_MESSAGE = (
@@ -71,7 +83,9 @@ NON_PATH_VALUE_OPTIONS = {
     "-b",
     "--branch",
 }
-PATH_VALUE_PREFIXES = tuple(option + "=" for option in PATH_VALUE_OPTIONS if option.startswith("--"))
+PATH_VALUE_PREFIXES = tuple(
+    option + "=" for option in PATH_VALUE_OPTIONS if option.startswith("--")
+)
 GIT_MUTATING_COMMANDS = {
     "add",
     "apply",
@@ -124,6 +138,28 @@ class DiffFile:
     hunks: list[list[str]]
 
 
+@dataclass
+class DiffApplicationPlan:
+    target: Path
+    relative_path: Path
+    affected_paths: list[str]
+    new_text: str
+
+
+def validate_allowed_commands(commands: set[str]) -> set[str]:
+    validated: set[str] = set()
+    for command in commands:
+        command_name = command.strip()
+        if not command_name:
+            raise ValueError("Allowed command entries must be non-empty strings")
+        if _is_forbidden_allowed_command(command_name):
+            raise ValueError(
+                f"`{command_name}` cannot be added to the allowed command list"
+            )
+        validated.add(command_name)
+    return validated
+
+
 class PermissionManager:
     def __init__(
         self,
@@ -135,7 +171,7 @@ class PermissionManager:
         self.logger = logger
         self.allowed_commands = set(DEFAULT_ALLOWED_COMMANDS)
         if allowed_commands:
-            self.allowed_commands.update(allowed_commands)
+            self.allowed_commands.update(validate_allowed_commands(allowed_commands))
 
     def confirm(
         self,
@@ -212,102 +248,73 @@ class PermissionManager:
             risk_message=risk_message,
         )
 
-    def apply_unified_diff(self, diff_text: str) -> EditResult:
-        try:
-            parsed = _parse_unified_diff(diff_text)
-        except ValueError as exc:
-            result = EditResult(False, str(exc), "EDIT_FAILED")
-            self.logger.log("EDIT_FAILED", result.message, diff=diff_text)
-            return result
-
-        if len(parsed) != 1:
-            result = EditResult(
-                False,
-                "Only one file may be edited per unified diff in v0.",
-                "EDIT_FAILED",
-            )
-            self.logger.log("EDIT_FAILED", result.message, diff=diff_text)
-            return result
-
-        diff_file = parsed[0]
-        if diff_file.new_path == "/dev/null":
-            result = EditResult(
-                False, "File deletion is forbidden in v0.", "BLOCKED_DESTRUCTIVE_ACTION"
-            )
+    def validate_unified_diff(self, diff_text: str) -> EditResult:
+        plan, result = self._build_diff_application_plan(diff_text)
+        if result is not None:
             self.logger.log(result.event_type, result.message, diff=diff_text)
             return result
 
-        try:
-            target = self._resolve_diff_path(diff_file.new_path)
-            if diff_file.old_path != "/dev/null":
-                old_target = self._resolve_diff_path(diff_file.old_path)
-                if old_target != target:
-                    raise ValueError("Renames and multi-path edits are forbidden in v0.")
-        except ValueError as exc:
-            result = EditResult(False, str(exc), "SANDBOX_DENIED")
+        assert plan is not None
+        result = EditResult(
+            True,
+            "Edit validated.",
+            "EDIT_VALIDATED",
+            plan.affected_paths,
+        )
+        self.logger.log(result.event_type, result.message, affected_paths=plan.affected_paths)
+        return result
+
+    def apply_unified_diff(self, diff_text: str, dry_run: bool = False) -> EditResult:
+        plan, result = self._build_diff_application_plan(diff_text)
+        if result is not None:
             self.logger.log(result.event_type, result.message, diff=diff_text)
             return result
 
-        affected = [str(target)]
-        if not target.parent.exists():
+        assert plan is not None
+        if dry_run:
+            result = EditResult(
+                True,
+                f"Dry-run: edit would modify {plan.relative_path.as_posix()}.",
+                "EDIT_DRY_RUN",
+                plan.affected_paths,
+            )
+            self.logger.log(
+                result.event_type,
+                result.message,
+                affected_paths=plan.affected_paths,
+                diff=diff_text,
+            )
+            return result
+
+        try:
+            snapshot = create_snapshot(self.project_root, [plan.relative_path])
+        except SnapshotError as exc:
             result = EditResult(
                 False,
-                "Parent directory must already exist for file edits.",
+                f"Snapshot failed; edit was not applied: {exc}",
                 "EDIT_FAILED",
-                affected,
+                plan.affected_paths,
             )
-            self.logger.log(result.event_type, result.message, affected_paths=affected)
+            self.logger.log(result.event_type, result.message, affected_paths=plan.affected_paths)
             return result
-        if target.exists() and target.is_dir():
-            result = EditResult(False, "Directory editing is forbidden.", "EDIT_FAILED", affected)
-            self.logger.log(result.event_type, result.message, affected_paths=affected)
-            return result
-        if target.exists() and _appears_binary(target):
-            result = EditResult(False, "Binary file editing is forbidden.", "EDIT_FAILED", affected)
-            self.logger.log(result.event_type, result.message, affected_paths=affected)
-            return result
-        if diff_file.old_path == "/dev/null" and target.exists():
-            result = EditResult(False, "New-file diff target already exists.", "CONFLICT", affected)
-            self.logger.log(result.event_type, result.message, affected_paths=affected)
-            return result
-
-        try:
-            original_text = target.read_text(encoding="utf-8") if target.exists() else ""
-        except UnicodeDecodeError:
-            result = EditResult(False, "Target file is not valid UTF-8 text.", "EDIT_FAILED", affected)
-            self.logger.log(result.event_type, result.message, affected_paths=affected)
-            return result
-        newline = _detect_newline(original_text)
-        original_lines = original_text.splitlines()
-
-        try:
-            new_lines = _apply_hunks(original_lines, diff_file.hunks)
-        except ValueError as exc:
-            result = EditResult(False, str(exc), "CONFLICT", affected)
-            self.logger.log(result.event_type, result.message, affected_paths=affected, diff=diff_text)
-            return result
-
-        new_text = newline.join(new_lines)
-        if new_lines:
-            new_text += newline
 
         temp_path: str | None = None
         try:
             fd, temp_path = tempfile.mkstemp(
-                prefix=f".{target.name}.",
+                prefix=f".{plan.target.name}.",
                 suffix=".tmp",
-                dir=target.parent,
+                dir=plan.target.parent,
                 text=True,
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-                    handle.write(new_text)
+                    handle.write(plan.new_text)
                     handle.flush()
                     os.fsync(handle.fileno())
-                if target.exists():
-                    mode = stat.S_IMODE(target.stat().st_mode)
+                if plan.target.exists():
+                    mode = stat.S_IMODE(plan.target.stat().st_mode)
                     os.chmod(temp_path, mode)
-                os.replace(temp_path, target)
+                os.replace(temp_path, plan.target)
             except Exception:
                 if temp_path and Path(temp_path).exists():
                     try:
@@ -316,26 +323,121 @@ class PermissionManager:
                         pass
                 raise
         except OSError as exc:
-            result = EditResult(False, f"Edit failed: {exc}", "EDIT_FAILED", affected, temp_path)
+            result = EditResult(
+                False,
+                f"Edit failed: {exc}",
+                "EDIT_FAILED",
+                plan.affected_paths,
+                temp_path,
+                snapshot.id,
+            )
             self.logger.log(
                 result.event_type,
                 result.message,
-                affected_paths=affected,
+                affected_paths=plan.affected_paths,
                 temp_path=temp_path,
+                snapshot_id=snapshot.id,
                 diff=diff_text,
             )
             return result
 
-        result = EditResult(True, "Edit applied.", "EDIT_APPLIED", affected, temp_path)
+        result = EditResult(
+            True,
+            "Edit applied.",
+            "EDIT_APPLIED",
+            plan.affected_paths,
+            temp_path,
+            snapshot.id,
+        )
         self.logger.log(
             result.event_type,
             result.message,
-            affected_paths=affected,
+            affected_paths=plan.affected_paths,
             temp_path=temp_path,
+            snapshot_id=snapshot.id,
             os_replace_succeeded=True,
             diff=diff_text,
         )
         return result
+
+    def _build_diff_application_plan(
+        self, diff_text: str
+    ) -> tuple[DiffApplicationPlan | None, EditResult | None]:
+        try:
+            parsed = _parse_unified_diff(diff_text)
+        except ValueError as exc:
+            return None, EditResult(False, str(exc), "EDIT_FAILED")
+
+        if len(parsed) != 1:
+            return None, EditResult(
+                False,
+                "Only one file may be edited per unified diff in v0.",
+                "EDIT_FAILED",
+            )
+
+        diff_file = parsed[0]
+        if diff_file.new_path == "/dev/null":
+            return None, EditResult(
+                False, "File deletion is forbidden in v0.", "BLOCKED_DESTRUCTIVE_ACTION"
+            )
+
+        try:
+            target = self._resolve_diff_path(diff_file.new_path)
+            if diff_file.old_path != "/dev/null":
+                old_target = self._resolve_diff_path(diff_file.old_path)
+                if old_target != target:
+                    raise ValueError("Renames and multi-path edits are forbidden in v0.")
+        except ValueError as exc:
+            return None, EditResult(False, str(exc), "SANDBOX_DENIED")
+
+        affected = [str(target)]
+        if not target.parent.exists():
+            return None, EditResult(
+                False,
+                "Parent directory must already exist for file edits.",
+                "EDIT_FAILED",
+                affected,
+            )
+        if target.exists() and target.is_dir():
+            return None, EditResult(
+                False, "Directory editing is forbidden.", "EDIT_FAILED", affected
+            )
+        if target.exists() and _appears_binary(target):
+            return None, EditResult(
+                False, "Binary file editing is forbidden.", "EDIT_FAILED", affected
+            )
+        if diff_file.old_path == "/dev/null" and target.exists():
+            return None, EditResult(
+                False, "New-file diff target already exists.", "CONFLICT", affected
+            )
+
+        try:
+            original_text = target.read_text(encoding="utf-8") if target.exists() else ""
+        except UnicodeDecodeError:
+            return None, EditResult(
+                False, "Target file is not valid UTF-8 text.", "EDIT_FAILED", affected
+            )
+        newline = _detect_newline(original_text)
+        original_lines = original_text.splitlines()
+
+        try:
+            new_lines = _apply_hunks(original_lines, diff_file.hunks)
+        except ValueError as exc:
+            return None, EditResult(False, str(exc), "CONFLICT", affected)
+
+        new_text = newline.join(new_lines)
+        if new_lines:
+            new_text += newline
+
+        return (
+            DiffApplicationPlan(
+                target=target,
+                relative_path=target.relative_to(self.project_root),
+                affected_paths=affected,
+                new_text=new_text,
+            ),
+            None,
+        )
 
     def _detect_destructive_raw_pattern(self, command: str) -> str:
         lowered = command.lower()
@@ -477,6 +579,8 @@ class PermissionManager:
 
     def _may_execute_project_defined_code(self, tokens: list[str]) -> bool:
         base = tokens[0]
+        if base == "npx":
+            return True
         if base == "npm" and len(tokens) >= 2 and tokens[1] in {"run", "test"}:
             return True
         if base == "pnpm" and len(tokens) >= 2 and tokens[1] not in {
@@ -568,6 +672,17 @@ def _may_modify_environment(tokens: list[str]) -> bool:
     if base == "make" and len(tokens) >= 2 and tokens[1] == "clean":
         return True
     return False
+
+
+def _is_forbidden_allowed_command(command: str) -> bool:
+    lowered = command.lower()
+    basename = Path(command).name.lower()
+    basename_without_exe = basename.removesuffix(".exe")
+    return (
+        lowered in FORBIDDEN_ALLOWED_COMMANDS
+        or basename in FORBIDDEN_ALLOWED_COMMANDS
+        or basename_without_exe in FORBIDDEN_ALLOWED_COMMANDS
+    )
 
 
 def _git_subcommand_index(tokens: list[str]) -> tuple[int | None, str]:

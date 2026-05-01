@@ -1,12 +1,14 @@
+import json
 import os
 import unittest
-from pathlib import Path
 
 from local_agent.logger import AgentLogger
+from local_agent.main import load_config
 from local_agent.permission_manager import (
     DEFAULT_ALLOWED_COMMANDS,
     PROJECT_CODE_RISK_MESSAGE,
     PermissionManager,
+    validate_allowed_commands,
 )
 from tests.helpers import workspace
 
@@ -66,6 +68,35 @@ class PermissionManagerTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(["pytest", "tests"], result.tokens)
+
+    def test_npx_is_risky_not_safe(self):
+        result = self.manager.validate_command("npx some-package")
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.risky)
+        self.assertEqual(PROJECT_CODE_RISK_MESSAGE, result.risk_message)
+
+    def test_forbidden_allowed_command_entries_raise(self):
+        for command in ["bash", "powershell", "powershell.exe"]:
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError):
+                    validate_allowed_commands({command})
+
+    def test_forbidden_allowed_commands_cannot_be_enabled_through_config(self):
+        for command in ["bash", "powershell"]:
+            with self.subTest(command=command):
+                (self.root / ".agent_config.json").write_text(
+                    json.dumps({"additional_allowed_commands": [command]}),
+                    encoding="utf-8",
+                )
+
+                config = load_config(self.root, self.logger)
+                manager = PermissionManager(self.root, self.logger, config.allowed_commands)
+                result = manager.validate_command(f"{command} -c pytest")
+
+                self.assertNotIn(command, config.allowed_commands)
+                self.assertFalse(result.ok)
+                self.assertIn("whitelist", result.message)
 
     def test_command_validation_allows_read_only_git_commands(self):
         commands = [

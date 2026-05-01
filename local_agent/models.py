@@ -108,6 +108,16 @@ class EditProposal:
 
 
 @dataclass(frozen=True)
+class PlanProposal:
+    steps: list[str]
+
+
+@dataclass(frozen=True)
+class SummaryProposal:
+    summary: str
+
+
+@dataclass(frozen=True)
 class CommandResult:
     command: str
     stdout: str
@@ -134,3 +144,4 @@ class EditResult:
     event_type: str
     affected_paths: list[str] = field(default_factory=list)
     temp_path: str | None = None
+    snapshot_id: str = ""
